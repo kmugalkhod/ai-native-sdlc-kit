@@ -1,0 +1,53 @@
+# AI in the PR review loop: every PR gets the same REVIEW.md passes; @claude on a comment fixes and pushes.
+# Findings never approve or block on their own: branch protection still requires a code owner.
+name: Claude review
+on:
+  pull_request:
+    types: [opened, synchronize, ready_for_review]
+  issue_comment:
+    types: [created]
+  pull_request_review_comment:
+    types: [created]
+
+permissions:
+  contents: write
+  pull-requests: write
+  issues: write
+  id-token: write
+
+jobs:
+  review:
+    if: github.event_name == 'pull_request' && !github.event.pull_request.draft
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with: { fetch-depth: 0 }
+      - uses: anthropics/claude-code-action@v1
+        with:
+          anthropic_api_key: ${{ secrets.ANTHROPIC_API_KEY }}
+          # use_bedrock: 'true'   # with aws-actions/configure-aws-credentials before this step
+          prompt: |
+            Review PR #${{ github.event.pull_request.number }} following REVIEW.md exactly.
+            Find the change folder under sdlc/changes/ this PR implements (branch name or files touched) and
+            check the diff against its spec.md and plan.md. Read CLAUDE.md.
+            Post ONE PR comment that starts with the line
+            `Important: <n> · Nit: <n> · Pre-existing: <n>` then the findings grouped by severity,
+            each tagged [bugs|security|compliance] with path:line. Do not approve or request changes.
+          claude_args: >-
+            --model sonnet
+            --allowedTools "Read,Grep,Glob,Bash(gh pr diff:*),Bash(gh pr view:*),Bash(gh pr comment:*),Bash(git log:*),Bash(git diff:*)"
+
+  respond:
+    if: >-
+      (github.event_name == 'issue_comment' && github.event.issue.pull_request && contains(github.event.comment.body, '@claude')) ||
+      (github.event_name == 'pull_request_review_comment' && contains(github.event.comment.body, '@claude'))
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with: { fetch-depth: 0 }
+      - uses: anthropics/claude-code-action@v1
+        with:
+          anthropic_api_key: ${{ secrets.ANTHROPIC_API_KEY }}
+          claude_args: >-
+            --model sonnet
+            --append-system-prompt "Follow CLAUDE.md. Fix code, never weaken tests. If the fix departs from the change's plan.md, update plan.md in the same commit."

@@ -1,0 +1,87 @@
+# AI-Native SDLC jobs for GitLab. Add to your .gitlab-ci.yml:
+#   include:
+#     - local: .gitlab/sdlc.gitlab-ci.yml
+#
+# CI/CD variables:
+#   SDLC_MARKETPLACE   git URL of the ai-native-sdlc kit repo (e.g. https://gitlab.example.com/tools/ai-native-sdlc.git)
+#   GITLAB_TOKEN       project access token (api, write_repository) for MR notes / pushes
+#   Model access, one of:
+#     ANTHROPIC_API_KEY (masked)
+#     Bedrock: CLAUDE_CODE_USE_BEDROCK=1, AWS_REGION, and AWS creds (OIDC/role on the runner)
+# Schedules: create a pipeline schedule with SDLC_JOB=monitor (hourly) and one with SDLC_JOB=evals (nightly).
+
+.sdlc_base:
+  image: node:20-bookworm
+  before_script:
+    - apt-get update -qq && apt-get install -y -qq python3 python3-yaml git curl >/dev/null
+    - npm install -g @anthropic-ai/claude-code >/dev/null
+    - claude plugin marketplace add "$SDLC_MARKETPLACE"
+    - claude plugin install sdlc@ai-native-sdlc
+    - git config user.name "sdlc-bot"; git config user.email "sdlc-bot@noreply.local"
+
+sdlc:evals:
+  extends: .sdlc_base
+  stage: test
+  script:
+    - python3 .sdlc/bin/evals.py --json eval-results.json
+  artifacts:
+    when: always
+    paths: [eval-results.json]
+  rules:
+    - if: $CI_PIPELINE_SOURCE == "schedule" && $SDLC_JOB == "evals"
+    - if: $CI_PIPELINE_SOURCE == "merge_request_event"
+      changes: [CLAUDE.md, REVIEW.md, ".claude/**/*", "evals/**/*", .sdlc/config.json]
+
+sdlc:review:
+  extends: .sdlc_base
+  stage: test
+  script:
+    - git fetch -q origin "$CI_MERGE_REQUEST_TARGET_BRANCH_NAME"
+    - |
+      claude -p "Review this merge request following REVIEW.md exactly. The diff is: git diff origin/$CI_MERGE_REQUEST_TARGET_BRANCH_NAME...HEAD. \
+      Find the change folder under sdlc/changes/ it implements and check against its spec.md and plan.md. Read CLAUDE.md. \
+      Output only the review in markdown, first line: Important: <n> · Nit: <n> · Pre-existing: <n>" \
+        --model sonnet --output-format text \
+        --allowedTools "Read,Grep,Glob,Bash(git diff:*),Bash(git log:*)" > review.md
+    - |
+      python3 - <<'EOF'
+      import json, os, urllib.request
+      body = open("review.md", encoding="utf-8").read()
+      url = f"{os.environ['CI_API_V4_URL']}/projects/{os.environ['CI_PROJECT_ID']}/merge_requests/{os.environ['CI_MERGE_REQUEST_IID']}/notes"
+      req = urllib.request.Request(url, data=json.dumps({"body": body}).encode(), method="POST",
+            headers={"PRIVATE-TOKEN": os.environ["GITLAB_TOKEN"], "Content-Type": "application/json"})
+      urllib.request.urlopen(req)
+      EOF
+  artifacts:
+    paths: [review.md]
+  rules:
+    - if: $CI_PIPELINE_SOURCE == "merge_request_event"
+
+sdlc:loop:
+  extends: .sdlc_base
+  stage: deploy
+  script:
+    - git remote set-url origin "https://oauth2:${GITLAB_TOKEN}@${CI_SERVER_HOST}/${CI_PROJECT_PATH}.git"
+    - git checkout -B "$CI_DEFAULT_BRANCH" "origin/$CI_DEFAULT_BRANCH"
+    - |
+      python3 .sdlc/bin/sdlc.py status --json | python3 -c '
+      import json,sys
+      for r in json.load(sys.stdin):
+          if r["stage"]=="design-ready": print(r["change"])' | while read -r c; do
+        git checkout -q "$CI_DEFAULT_BRANCH"
+        python3 .sdlc/bin/pipeline.py "$c" --to plan --pr || echo "WARN: $c escalated"
+      done
+  rules:
+    - if: $CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH && $CI_PIPELINE_SOURCE == "push"
+      changes: ["sdlc/changes/**/intent.md"]
+
+sdlc:monitor:
+  extends: .sdlc_base
+  stage: deploy
+  script:
+    - python3 .sdlc/bin/monitor.py
+  cache:
+    key: sdlc-monitor-state
+    paths: [.sdlc/state/]
+  rules:
+    - if: $CI_PIPELINE_SOURCE == "schedule" && $SDLC_JOB == "monitor"

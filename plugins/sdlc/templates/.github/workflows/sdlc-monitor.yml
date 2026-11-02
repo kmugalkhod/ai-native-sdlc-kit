@@ -1,0 +1,36 @@
+# Closing the loop: deterministic control bands; Claude is invoked only on a breach, with tier-scoped tools.
+name: SDLC monitor
+on:
+  schedule:
+    - cron: '17 * * * *'
+  workflow_dispatch:
+
+permissions:
+  contents: write
+  pull-requests: write
+  actions: read
+  id-token: write
+
+jobs:
+  monitor:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with: { node-version: '20' }
+      - uses: actions/setup-python@v5
+        with: { python-version: '3.12' }
+      - run: |
+          pip install pyyaml
+          npm install -g @anthropic-ai/claude-code
+          claude plugin marketplace add "${{ vars.SDLC_MARKETPLACE }}"
+          claude plugin install sdlc@ai-native-sdlc
+      - name: Check bands
+        env:
+          ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          git config user.name "sdlc-monitor[bot]"; git config user.email "sdlc-monitor@users.noreply.github.com"
+          python .sdlc/bin/monitor.py
+      # Note: .sdlc/state/monitor.json (cooldowns) is not persisted between runs here; use actions/cache
+      # on .sdlc/state if you need cooldowns across scheduled runs.

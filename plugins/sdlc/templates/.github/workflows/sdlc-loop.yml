@@ -1,0 +1,52 @@
+# Artifact-triggered loop: an accepted intent.md merged to main fires spec -> plan headlessly,
+# with the gatekeeper between stages, and opens a PR for human review. Build can be fired the same way.
+name: SDLC loop
+on:
+  push:
+    branches: [main, master]
+    paths: ['sdlc/changes/**/intent.md']
+  workflow_dispatch:
+    inputs:
+      change: { description: 'change folder (or unique substring)', required: true }
+      from:   { description: 'from stage', default: 'spec', type: choice, options: [spec, plan, build, review] }
+      to:     { description: 'to stage',   default: 'plan', type: choice, options: [spec, plan, build, review] }
+
+permissions:
+  contents: write
+  pull-requests: write
+  id-token: write
+
+jobs:
+  loop:
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+    steps:
+      - uses: actions/checkout@v4
+        with: { fetch-depth: 0 }
+      - uses: actions/setup-node@v4
+        with: { node-version: '20' }
+      - uses: actions/setup-python@v5
+        with: { python-version: '3.12' }
+      - name: Install Claude Code + sdlc plugin
+        run: |
+          npm install -g @anthropic-ai/claude-code
+          claude plugin marketplace add "${{ vars.SDLC_MARKETPLACE }}"
+          claude plugin install sdlc@ai-native-sdlc
+      - name: Run loop
+        env:
+          ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          git config user.name "sdlc-loop[bot]"; git config user.email "sdlc-loop@users.noreply.github.com"
+          if [ -n "${{ inputs.change }}" ]; then
+            python .sdlc/bin/pipeline.py "${{ inputs.change }}" --from "${{ inputs.from }}" --to "${{ inputs.to }}" --pr
+            exit $?
+          fi
+          # push trigger: every accepted intent that has no spec yet
+          python .sdlc/bin/sdlc.py status --json | python -c '
+          import json,sys
+          for r in json.load(sys.stdin):
+              if r["stage"]=="design-ready": print(r["change"])' | while read -r c; do
+            git checkout -q main 2>/dev/null || git checkout -q master
+            python .sdlc/bin/pipeline.py "$c" --to plan --pr || echo "::warning::$c escalated"
+          done

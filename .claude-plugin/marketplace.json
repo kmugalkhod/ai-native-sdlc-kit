@@ -1,0 +1,14 @@
+{
+  "name": "ai-native-sdlc",
+  "description": "AI-Native SDLC Playbook for Claude Code: one plugin that runs intent -> spec -> plan -> build -> test -> review -> deploy -> maintain as a governed loop.",
+  "owner": {
+    "name": "Kunal"
+  },
+  "plugins": [
+    {
+      "name": "sdlc",
+      "source": "./plugins/sdlc",
+      "description": "AI-Native SDLC loop for Claude Code: intent -> spec -> plan -> build -> test -> review -> deploy -> maintain, with committed artifacts, hooks as gates, evals and control-band monitoring."
+    }
+  ]
+}

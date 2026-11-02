@@ -1,0 +1,9 @@
+{
+  "name": "sdlc",
+  "displayName": "AI-Native SDLC",
+  "version": "1.0.0",
+  "description": "Runs the AI-Native SDLC Playbook inside Claude Code: one committed artifact per stage (intent.md, spec.md, plan.md, diff+tests, review findings, incident intent), skills for policy, hooks for deterministic gates, evals in CI and a control-band loop that writes the next intent.md.",
+  "author": { "name": "Kunal" },
+  "license": "MIT",
+  "keywords": ["sdlc", "intent", "spec", "plan-mode", "hooks", "evals", "review", "governance"]
+}

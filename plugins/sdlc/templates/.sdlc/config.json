@@ -1,0 +1,40 @@
+{
+  "changes_dir": "sdlc/changes",
+  "lessons_dir": "sdlc/lessons",
+  "protected_paths": [".claude/settings.json", "REVIEW.md"],
+  "test_globs": [
+    "tests/**", "test/**", "**/__tests__/**",
+    "**/test_*.py", "**/*_test.py", "**/*_test.go",
+    "**/*.test.*", "**/*.spec.*", "**/src/test/**", "**/itest/**"
+  ],
+  "verify": { "build": "", "test": "", "lint": "" },
+  "format_cmd": "",
+  "lint_on_edit_cmd": "",
+  "prod_gate": {
+    "mode": "block",
+    "patterns": [
+      "\\bdeploy\\b.*\\bprod(uction)?\\b",
+      "\\bhelm\\b.*\\b(upgrade|install)\\b.*\\bprod",
+      "\\bkubectl\\b.*\\b(apply|delete|rollout|scale)\\b.*\\bprod",
+      "\\bterraform\\b.*\\bapply\\b.*\\bprod"
+    ],
+    "approval_env": "RELEASE_APPROVAL",
+    "approval_ttl_minutes": 120
+  },
+  "protected_branches": ["main", "master"],
+  "secret_scan": true,
+  "secret_scan_exclude": [],
+  "tracker": { "type": "none", "url_template": "" },
+  "vcs": "auto",
+  "models": {
+    "spec": "sonnet",
+    "plan": "sonnet",
+    "build": "sonnet",
+    "review": "sonnet",
+    "gate": "sonnet",
+    "triage": "sonnet",
+    "evals": "sonnet"
+  },
+  "pipeline": { "commit": true, "branch_prefix": "sdlc/", "open_pr": false, "max_fix_rounds": 3 },
+  "evals": { "dir": "evals/cases", "threshold": 0.9 }
+}
