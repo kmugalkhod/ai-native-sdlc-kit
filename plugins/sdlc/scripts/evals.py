@@ -39,7 +39,7 @@ CONFIG_PATHS = ["CLAUDE.md", "REVIEW.md", ".claude"]
 
 
 def sh(cmd: str, cwd: Path, timeout: int = 900) -> subprocess.CompletedProcess:
-    return subprocess.run(cmd, shell=True, cwd=cwd, capture_output=True, text=True, timeout=timeout)
+    return subprocess.run(cmd, shell=True, cwd=cwd, capture_output=True, text=True, encoding="utf-8", errors="replace", timeout=timeout)
 
 
 def run_case(root: Path, case: dict, model: str, keep: bool) -> dict:
@@ -48,7 +48,7 @@ def run_case(root: Path, case: dict, model: str, keep: bool) -> dict:
     t0 = time.time()
     try:
         subprocess.run(["git", "worktree", "add", "--detach", str(wt), case.get("ref", "HEAD")], cwd=root,
-                       capture_output=True, text=True, check=True)
+                       capture_output=True, text=True, encoding="utf-8", errors="replace", check=True)
         for p in CONFIG_PATHS:  # test the working-tree configuration, committed or not
             src, dst = root / p, wt / p
             if src.is_dir():
@@ -70,7 +70,7 @@ def run_case(root: Path, case: dict, model: str, keep: bool) -> dict:
                "--allowedTools", *case.get("allowed_tools", ["Read", "Grep", "Glob", "Edit", "Write"])]
         if os.environ.get("SDLC_PLUGIN_DIR"):
             cmd += ["--plugin-dir", os.environ["SDLC_PLUGIN_DIR"]]
-        r = subprocess.run(cmd, cwd=wt, capture_output=True, text=True, timeout=case.get("timeout", 1800))
+        r = subprocess.run(cmd, cwd=wt, capture_output=True, text=True, encoding="utf-8", errors="replace", timeout=case.get("timeout", 1800))
         try:
             out = json.loads(r.stdout)
             res["cost_usd"] = out.get("total_cost_usd")

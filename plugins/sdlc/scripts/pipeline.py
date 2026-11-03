@@ -52,7 +52,7 @@ def claude(prompt: str, model: str, tools: list[str], root: Path, agent: str | N
     print(f"  $ claude -p {prompt[:70]!r}... --model {model}" + (f" --agent {agent}" if agent else ""), flush=True)
     if dry:
         return '{"verdict":"pass","reasons":["dry run"]}'
-    r = subprocess.run(cmd, cwd=root, capture_output=True, text=True)
+    r = subprocess.run(cmd, cwd=root, capture_output=True, text=True, encoding="utf-8", errors="replace")
     try:
         data = json.loads(r.stdout)
     except json.JSONDecodeError:
@@ -99,7 +99,7 @@ def verify(root: Path, cfg: dict) -> tuple[bool, str]:
     for k, c in cfg["verify"].items():
         if not c:
             continue
-        r = subprocess.run(c, shell=True, cwd=root, capture_output=True, text=True)
+        r = subprocess.run(c, shell=True, cwd=root, capture_output=True, text=True, encoding="utf-8", errors="replace")
         out.append(f"=== {k}: {c} -> exit {r.returncode}\n{(r.stdout + r.stderr)[-4000:]}")
         ok &= r.returncode == 0
     return ok, "\n".join(out) or "no verify commands configured"

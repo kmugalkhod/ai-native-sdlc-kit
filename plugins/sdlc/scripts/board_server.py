@@ -377,9 +377,9 @@ function renderNav(){const epics=items("epic"),stories=items("story"),tasks=item
   $("nav").innerHTML=h}
 
 /* crumb */
-function renderCrumb(){if(!fstory){$("crumb").innerHTML=`All work <span class="sub">· ${work().length} items</span>`;return}
+function renderCrumb(){if(!fstory){$("crumb").innerHTML=`All work <span class="sub">· ${(n=>n+(n===1?" item":" items"))(work().length)}</span>`;return}
   const s=fstory==="design"?{key:"Design",title:"UI design"}:S.items.find(i=>i.key===fstory)||{};
-  $("crumb").innerHTML=`<span class="tag" style="--sc:${fstory==="design"?"var(--pink)":storyColor(fstory)}">${esc(s.key)}</span> ${esc(s.title||"")} <span class="sub">· ${work().length} items</span> <button class="clear" data-story="">Clear</button>`}
+  $("crumb").innerHTML=`<span class="tag" style="--sc:${fstory==="design"?"var(--pink)":storyColor(fstory)}">${esc(s.key)}</span> ${esc(s.title||"")} <span class="sub">· ${(n=>n+(n===1?" item":" items"))(work().length)}</span> <button class="clear" data-story="">Clear</button>`}
 
 /* board */
 function card(t){const live=liveOn(t.key);

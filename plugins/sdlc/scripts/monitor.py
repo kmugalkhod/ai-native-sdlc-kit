@@ -45,7 +45,7 @@ def read_series(root: Path, src: dict) -> list[float]:
     if "csv" in src:
         with open(root / src["csv"], newline="", encoding="utf-8") as f:
             return [float(r[src.get("column", "value")]) for r in csv.DictReader(f) if r.get(src.get("column", "value"))]
-    out = subprocess.run(src["cmd"], shell=True, cwd=root, capture_output=True, text=True, timeout=300).stdout
+    out = subprocess.run(src["cmd"], shell=True, cwd=root, capture_output=True, text=True, encoding="utf-8", errors="replace", timeout=300).stdout
     try:
         data = json.loads(out)
         return [float(x["v"] if isinstance(x, dict) else x) for x in data]
@@ -113,7 +113,7 @@ def invoke_claude(root: Path, cfg: dict, m: dict, tier_name: str, tier: dict, fi
     print(f"  invoking Claude ({action}) with tools: {', '.join(tools)}")
     if dry:
         return
-    r = subprocess.run(cmd, cwd=root, capture_output=True, text=True, timeout=3600)
+    r = subprocess.run(cmd, cwd=root, capture_output=True, text=True, encoding="utf-8", errors="replace", timeout=3600)
     try:
         res = json.loads(r.stdout).get("result", "")
     except json.JSONDecodeError:

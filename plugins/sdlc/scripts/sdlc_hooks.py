@@ -196,7 +196,7 @@ def post_edit(root: Path, cfg: dict, payload: dict) -> None:
             continue
         cmd = tmpl.replace("{file}", shlex.quote(rel))
         try:
-            r = subprocess.run(cmd, shell=True, cwd=root, capture_output=True, text=True, timeout=100)
+            r = subprocess.run(cmd, shell=True, cwd=root, capture_output=True, text=True, encoding="utf-8", errors="replace", timeout=100)
         except subprocess.TimeoutExpired:
             print(f"[sdlc] {key} timed out: {cmd}", file=sys.stderr)
             continue

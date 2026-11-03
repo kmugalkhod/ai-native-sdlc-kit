@@ -15,6 +15,7 @@ Bash tool cannot perform them.
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import os
 import re
@@ -25,7 +26,7 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 from sdlc_core import (audit, changes, find_root, git, header_field, load_config, read_state,  # noqa: E402
-                       stage_of, state_path, utcnow)
+                       setup_signature, stage_of, state_path, utcnow)
 
 NEXT_STEP = {
     "intent": "product owner reviews intent.md, sets Status: accepted -> /sdlc:spec",
@@ -128,11 +129,24 @@ def cmd_verify(root: Path, cfg: dict, a) -> None:
         cmd = cfg["verify"].get(k)
         if not cmd:
             continue
+        if k == "setup" and (not a.steps or os.environ.get("SDLC_SETUP_IF_CHANGED")) \
+                and not os.environ.get("SDLC_FORCE_SETUP"):
+            sig = setup_signature(root, cmd)
+            if sig and (read_state(root, "setup.json") or {}).get("sig") == sig:
+                print(f"\n=== setup: SKIP (dependencies unchanged since the last install; "
+                      f"`verify setup` forces it)", flush=True)
+                continue
         print(f"\n=== {k}: {cmd}", flush=True)
         r = subprocess.run(cmd, shell=True, cwd=root)
         print(f"=== {k}: {'PASS' if r.returncode == 0 else f'FAIL (exit {r.returncode})'}", flush=True)
         if r.returncode:
             failed.append(k)
+        elif k == "setup":
+            sig = setup_signature(root, cmd)
+            if sig:
+                sp = state_path(root, "setup.json")
+                sp.parent.mkdir(parents=True, exist_ok=True)
+                sp.write_text(json.dumps({"sig": sig, "at": utcnow()}), encoding="utf-8")
     sys.exit(1 if failed else 0)
 
 

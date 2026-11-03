@@ -42,7 +42,8 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 from board import Board, STATUS_LABEL  # noqa: E402
-from sdlc_core import audit, changes, find_root, git, header_field, load_config, matches_any, utcnow  # noqa: E402
+from sdlc_core import (audit, changes, find_root, git, header_field, load_config, matches_any,  # noqa: E402
+                       setup_signature, utcnow)
 import trackers  # noqa: E402
 
 BOARD_CLI = "python3 .sdlc/bin/board.py"
@@ -61,7 +62,7 @@ def log(msg: str) -> None:
 
 
 def sh(cmd, cwd, timeout=600, env=None) -> subprocess.CompletedProcess:
-    return subprocess.run(cmd, cwd=cwd, shell=isinstance(cmd, str), capture_output=True, text=True,
+    return subprocess.run(cmd, cwd=cwd, shell=isinstance(cmd, str), capture_output=True, text=True, encoding="utf-8", errors="replace",
                           timeout=timeout, env=env)
 
 
@@ -102,7 +103,7 @@ class AgentRun:
         for d in ([plugin_dir] if isinstance(plugin_dir, str) else (plugin_dir or [])):
             if d:
                 self.cmd += ["--plugin-dir", d]
-        self.env = {**os.environ, **(extra_env or {})}
+        self.env = {**os.environ, "PYTHONIOENCODING": "utf-8", "PYTHONUTF8": "1", **(extra_env or {})}
         self.timeout = timeout_min * 60
         self.proc: subprocess.Popen | None = None
         self.result_text, self.cost, self.error = "", 0.0, None
@@ -127,7 +128,7 @@ class AgentRun:
         started = time.time()
         try:
             self.proc = subprocess.Popen(self.cmd, cwd=self.cwd, env=self.env, stdout=subprocess.PIPE,
-                                         stderr=subprocess.PIPE, text=True, bufsize=1)
+                                         stderr=subprocess.PIPE, text=True, encoding="utf-8", errors="replace", bufsize=1)
             for line in self.proc.stdout:
                 if time.time() - started > self.timeout:
                     self.error = f"timed out after {self.timeout // 60} min"
@@ -222,10 +223,13 @@ Read {rel}/intent.md, {rel}/spec.md and {rel}/plan.md (whichever exist), CLAUDE.
 
 Rules:
 - One epic for the change. Stories follow the spec's user-facing capabilities (2–6 stories).
-- Tasks are 15–60 minutes of agent work each, 2–5 per story. Each task lists the files it will create or change.
+- Tasks are 15–30 minutes of agent work each, 2–5 per story. Each task lists the files it will create or change.
   Keep tasks file-disjoint where possible so parallel developers don't collide.
-- If the project needs a skeleton (app entry point, package layout, test setup), make that the first task and
-  let every other task depend on it.
+- Plan for parallel work: with {devs} developers, at least {devs} tasks should be startable right after the first
+  one. A task depends only on tasks whose code it truly needs.
+- If the project needs a skeleton, keep it SMALL (under 15 minutes): entry point, package layout, dependency
+  manifests, config loading, test setup — no features. If there is a backend and a frontend, make them two separate
+  skeleton tasks with no dependency between them, and let each later task depend only on the skeleton it builds on.
 - depends_on uses task ids from this file. No cycles.
 - Each task has testable acceptance criteria and a "qa" note: how a QA agent proves it in a browser or via the API.
 - Mark "ui": true on every task that creates or changes something a user sees (pages, components, styles, copy),
@@ -384,17 +388,19 @@ def load_breakdown(root: Path, cfg: dict, change: Path, data: dict, devs: int) -
             is_ui = bool(t["ui"]) if "ui" in t else \
                 any(matches_any(f, cfg["team"]["design"]["ui_globs"]) for f in t.get("files", []))
             pending.append((tk, t.get("depends_on", []), is_ui))
-    # guard: never hold backend work for the design. A "UI" task that any non-UI task depends on (directly or
-    # through others) is foundation work, e.g. a skeleton with a placeholder page, so it does not wait for D-1.
-    by_id = {idmap[t["id"]]: [idmap[d] for d in t.get("depends_on", []) if d in idmap]
-             for s in data["stories"] for t in s.get("tasks", [])}
-    needed_by_backend, stack = set(), [tk for tk, _d, ui in pending if not ui]
-    while stack:
-        for dep in by_id.get(stack.pop(), []):
-            if dep not in needed_by_backend:
-                needed_by_backend.add(dep); stack.append(dep)
-    freed = [tk for tk, _d, ui in pending if ui and tk in needed_by_backend]
-    pending = [(tk, d, ui and tk not in needed_by_backend) for tk, d, ui in pending]
+    # guard: the foundation task must never wait for the design. A "UI" task with no dependencies of its own that
+    # non-UI tasks build on directly (typically the skeleton with a placeholder page) starts at once. Real screens
+    # (app shell, pages) depend on something, so they keep waiting for the approved design.
+    direct = {}
+    for s_ in data["stories"]:
+        for t in s_.get("tasks", []):
+            for d in t.get("depends_on", []):
+                if d in idmap:
+                    direct.setdefault(idmap[d], []).append(idmap[t["id"]])
+    ui_of = {tk: ui for tk, _d, ui in pending}
+    freed = [tk for tk, deps, ui in pending
+             if ui and not [d for d in deps if d in idmap] and any(not ui_of[c] for c in direct.get(tk, []))]
+    pending = [(tk, d, ui and tk not in freed) for tk, d, ui in pending]
     # design: a designer agent designs every UI task before it is built (backend tasks don't wait)
     dmode = cfg["team"]["design"]["mode"]
     ui_tasks = [tk for tk, _d, is_ui in pending if is_ui]
@@ -411,9 +417,9 @@ def load_breakdown(root: Path, cfg: dict, change: Path, data: dict, devs: int) -
         b.set_meta(design={"key": design_key, "mode": world, "evidence": evidence, "ui_tasks": ui_tasks})
         b.event(design_key, "lead", "assign", f"{world}: designer designs {len(ui_tasks)} UI task(s) first")
         if freed:
-            b.event(design_key, "lead", "system", f"{', '.join(freed)} touch UI files but backend work depends on "
-                                                  "them — they start now instead of waiting for the design")
-            log(f"{', '.join(freed)}: backend depends on them — not waiting for the design")
+            b.event(design_key, "lead", "system", f"{', '.join(freed)}: foundation task that backend work builds on — "
+                                                  "starts now instead of waiting for the design")
+            log(f"{', '.join(freed)}: foundation task — not waiting for the design")
     # dependencies, then a first assignment that spreads the work (the lead rebalances at run time)
     load = {d: 0 for d in dev_names}
     for tk, deps, is_ui in pending:
@@ -483,8 +489,11 @@ How to work:
 1. Check messages first: {cli} inbox  (check again after each major step — teammates may answer you).
 2. Implement the task. New packages go into the manifest (requirements.txt / package.json) and are installed by
    `python3 .sdlc/bin/sdlc.py verify setup` — never pip/npm install by hand.
-3. Write or extend tests for the acceptance criteria. Run `python3 .sdlc/bin/sdlc.py verify` until it is green.
-   Fix the code, never weaken a test.
+3. Write or extend tests for the acceptance criteria. While iterating run only the narrowest check (one test file,
+   e.g. `python3 -m pytest tests/test_x.py -q`, or one npm script). Run the full `python3 .sdlc/bin/sdlc.py verify`
+   once at the end (it skips reinstalling unchanged dependencies); fix the code, never weaken a test.
+   Time budget: about {budget} minutes. Do not loop on tooling problems (npm/pip paths, shells) for more than a few
+   tries — if the toolchain itself is broken, `{cli} blocked {key} "what fails"` and stop.
 4. Commit on your branch: git add -A && git commit -m "{key}: <what>"
 5. Talk to the team when it helps: {cli} ask <dev-N|qa|developer> "question" --task {key}   ·   {cli} comment {key} "progress"
    If you cannot continue without a teammate or a human: {cli} blocked {key} "exactly what you need"  — then stop.
@@ -552,7 +561,9 @@ Deliverables — commit all of them:
 3. {rel}/design/design-notes.md — the direction in two sentences, screens, components, tokens, interactions,
    accessibility, assumptions, and for EACH UI task key exactly what to build and which part of the mockup it is.
 4. Check it before you submit: open {mockup_url} in the browser tool at 1280px and 390px wide, look at it, fix what
-   is off{critique}.
+   is off{critique}. At most TWO rounds of check-and-fix — the human reviews it next and can ask for changes.
+Time budget: about {budget} minutes. As soon as mockup.html covers every screen and state and the notes are written,
+commit and run design-ready. Do not keep polishing.
 
 Then commit (git add -A && git commit -m "{key}: design") and run:
   {cli} design-ready {key} "two-sentence summary: the direction, the screens, what the reviewer should look at"
@@ -653,6 +664,7 @@ class Lead:
         if self.design:
             self.start_design_server()
         self.b.event(None, "lead", "system", f"team started: {', '.join(self.designers + self.devs + self.qas)}")
+        self.warm(self.devs + self.qas)
 
     def start_design_server(self) -> None:
         """Serve the worktrees' design folders on localhost so designer, devs, QA and the human see the mockup."""
@@ -711,7 +723,35 @@ class Lead:
         return self.b.items(type_="task")
 
     def busy(self, agent: str) -> bool:
-        return agent in self.running
+        w = getattr(self, "warming", {}).get(agent)
+        return agent in self.running or bool(w and w.is_alive())
+
+    def warm(self, names: list[str]) -> None:
+        """Install dependencies in idle agents' worktrees in the background, so agents don't spend their own time
+        (and time budget) on pip/npm. Skips when the manifests are unchanged since that worktree's last install."""
+        cmd = (self.cfg.get("verify") or {}).get("setup")
+        if not cmd or not setup_signature(self.wt("integration"), cmd):
+            return  # nothing to install yet (e.g. before the skeleton task lands)
+        self.warming = getattr(self, "warming", {})
+        for n in names:
+            if self.busy(n):
+                continue
+            wt = self.wt(n)
+
+            def job(n=n, wt=wt):
+                sh(["git", "checkout", "-q", "--detach", self.integration], wt)
+                env = {**os.environ, "SDLC_SETUP_IF_CHANGED": "1", "PYTHONIOENCODING": "utf-8"}
+                r = sh([sys.executable, ".sdlc/bin/sdlc.py", "verify", "setup"], wt, timeout=1800, env=env)
+                skipped = "SKIP" in (r.stdout or "")
+                if not skipped:
+                    self.b.event(None, "lead", "system", f"{n}: dependencies "
+                                 + ("installed in its worktree" if r.returncode == 0 else
+                                    f"install failed — the agent will retry: {(r.stdout + r.stderr).strip()[-200:]}"))
+                self.b.upsert_agent(n, activity="ready")
+            self.b.upsert_agent(n, activity="installing dependencies")
+            th = threading.Thread(target=job, daemon=True)
+            th.start()
+            self.warming[n] = th
 
     def idle(self, names: list[str]) -> list[str]:
         return [n for n in names if not self.busy(n)]
@@ -773,6 +813,10 @@ class Lead:
             return
         others = ", ".join(n for n in self.devs + self.qas if n != agent)
         extra = ""
+        if self.attempts.get(t["key"]):
+            extra += ("\nYOUR PREVIOUS RUN ON THIS TASK STOPPED (time limit or exit) BEFORE YOU SUBMITTED. Its work is "
+                      "committed on your branch: read `git log --oneline -5` and `git diff " + self.integration + " --stat`, "
+                      "CONTINUE from it — do not start over — get verify green and submit.\n")
         fails = [e for e in self.b.events(item_key=t["key"], limit=50) if e["kind"] == "qa" and e["text"].startswith("FAIL")]
         if fails:
             extra += f"\nQA SENT THIS BACK (round {len(fails)}): {fails[-1]['text'][6:]}\nFix it, then submit again.\n"
@@ -785,7 +829,8 @@ class Lead:
                 f"- {m['sender']}: {m['text']}" for m in helps[-5:]) + "\n"
         if self.design and self.design["key"] in t["depends_on"]:
             extra += DESIGN_FOR_DEV.format(rel=self.rel, mockup_url=self.mockup_url(), key=t["key"], cli=BOARD_CLI)
-        ctx = {**self.context(t), "agent": agent, "others": others, "wt": wt, "branch": branch, "extra": extra}
+        ctx = {**self.context(t), "agent": agent, "others": others, "wt": wt, "branch": branch, "extra": extra,
+               "budget": max(10, int(self.t["run_timeout_minutes"] * 0.6))}
         self.b.update(t["key"], "lead", status="in_progress", assignee=agent, branch=branch)
         behaviour = "block" if self.a.simulate and t["key"] == "T-4" and not self.help_rounds.get("T-4") else ""
         self.launch(agent, "developer", "developer", t, DEV_PROMPT.format(**ctx), wt,
@@ -836,11 +881,16 @@ class Lead:
                    if e["kind"] == "design" and e["text"].startswith("CHANGES:")]
         feedback = (f"\nTHE HUMAN ASKED FOR CHANGES (round {len(changes)}): {changes[-1]}\n"
                     "Update the design (keep what they did not mention), then design-ready again.\n") if changes else ""
+        if self.attempts.get(d["key"]) and not changes:
+            feedback += ("\nYOUR PREVIOUS RUN STOPPED BEFORE design-ready. Your files are committed in this worktree "
+                         "(DESIGN.md, the mockup, the notes): check what is missing, finish only that, then commit and "
+                         "run design-ready right away.\n")
         epic = self.b.item(d["parent_key"]) or {}
         prompt = DESIGN_PROMPT.format(
             epic_title=epic.get("title", ""), mode=mode, evidence=self.design.get("evidence", ""), mode_rules=rules,
             impeccable_steps=steps, wt=wt, branch=branch, rel=self.rel, ui_tasks=ui_text, key=d["key"], cli=BOARD_CLI,
             mockup_url=self.mockup_url("designer"), feedback=feedback,
+            budget=max(10, int(self.t["run_timeout_minutes"] * 0.6)),
             critique="; if the impeccable skill is loaded, run its critique and audit on the mockup and fix the findings")
         self.b.update(d["key"], "lead", status="in_progress", branch=branch)
         self.launch(agent, "designer", "designer", d, prompt, wt, self.t["models"].get("designer", "sonnet"),
@@ -979,6 +1029,7 @@ class Lead:
         self.b.update(t["key"], "lead", note=f"merged into {self.integration}", status="done")
         self.b.event(t["key"], "lead", "merge", f"merged {src} into {self.integration}")
         log(f"merged {t['key']} into {self.integration}")
+        self.warm(self.devs + self.qas)  # new manifests from this merge get installed while agents are idle
 
     # ---------------------------------------------------------------- the loop
     def tick(self) -> None:

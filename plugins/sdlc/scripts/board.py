@@ -31,6 +31,13 @@ import os
 import sqlite3
 import subprocess
 import sys
+
+# Windows consoles default to cp1252, which cannot print the arrows and dashes these tools use
+for _s in (sys.stdout, sys.stderr):
+    try:
+        _s.reconfigure(encoding="utf-8", errors="replace")
+    except Exception:
+        pass
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -68,7 +75,7 @@ def main_repo_root(start: Path | None = None) -> Path:
     cwd = str(start or Path.cwd())
     try:
         common = subprocess.run(["git", "rev-parse", "--path-format=absolute", "--git-common-dir"], cwd=cwd,
-                                capture_output=True, text=True, timeout=10).stdout.strip()
+                                capture_output=True, text=True, encoding="utf-8", errors="replace", timeout=10).stdout.strip()
         if common:
             return Path(common).parent
     except Exception:

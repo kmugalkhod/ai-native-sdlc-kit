@@ -4,11 +4,19 @@ Used by the plugin hooks and by the repo-local CLI in .sdlc/bin/. Standard libra
 """
 from __future__ import annotations
 
+import hashlib
 import json
 import os
 import re
 import subprocess
 import sys
+
+# Windows consoles default to cp1252, which cannot print the arrows and dashes these tools use
+for _s in (sys.stdout, sys.stderr):
+    try:
+        _s.reconfigure(encoding="utf-8", errors="replace")
+    except Exception:
+        pass
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -149,7 +157,7 @@ def read_state(root: Path, name: str) -> dict | None:
 
 def git(root: Path, *args: str) -> str:
     try:
-        return subprocess.run(["git", *args], cwd=root, capture_output=True, text=True, timeout=30).stdout.strip()
+        return subprocess.run(["git", *args], cwd=root, capture_output=True, text=True, encoding="utf-8", errors="replace", timeout=30).stdout.strip()
     except Exception:
         return ""
 
@@ -187,3 +195,31 @@ def stage_of(change_dir: Path) -> str:
             return "rejected"
         return "design-ready" if st in ("accepted", "approved") else "intent"
     return "empty"
+
+
+MANIFESTS = ("requirements.txt", "requirements-dev.txt", "pyproject.toml", "setup.cfg", "setup.py", "Pipfile.lock",
+             "poetry.lock", "uv.lock", "package.json", "package-lock.json", "pnpm-lock.yaml", "yarn.lock")
+
+
+def setup_signature(root: Path, cmd: str) -> str:
+    """Hash of every dependency manifest plus whether the installed envs exist. Empty when nothing to compare."""
+    h, seen = hashlib.sha1(cmd.encode()), 0
+    for dirpath, dirs, files in os.walk(root):
+        dirs[:] = [d for d in dirs if d not in (".git", ".venv", "venv", "node_modules", ".sdlc", "dist", "build",
+                                                "__pycache__", ".pytest_cache")]
+        if len(Path(dirpath).relative_to(root).parts) > 3:
+            dirs[:] = []
+            continue
+        for f in sorted(files):
+            if f in MANIFESTS:
+                fp = Path(dirpath) / f
+                h.update(fp.relative_to(root).as_posix().encode())
+                h.update(fp.read_bytes())
+                seen += 1
+                if f == "package.json":
+                    h.update(b"nm" if (Path(dirpath) / "node_modules").is_dir() else b"no-nm")
+    for venv in (".venv", "venv"):
+        if venv in cmd:
+            h.update(b"venv" if (root / venv).is_dir() else b"no-venv")
+    return h.hexdigest() if seen else ""
+
