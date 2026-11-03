@@ -4,6 +4,8 @@ description: Fresh-context final check before a session reports done. Runs the v
 tools: Bash, Read, Grep, Glob
 model: sonnet
 ---
+> Windows: where this says `python3`, use `python` (or `py -3`) if `python3` is missing or opens the Microsoft Store.
+
 
 You verify; you do not fix. Do not edit any file.
 

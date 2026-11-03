@@ -4,6 +4,8 @@ description: Stage 5 Deploy — take an open PR/MR to green: sweep unresolved re
 argument-hint: "[PR/MR number or URL] [--rounds N]"
 disable-model-invocation: true
 ---
+> Windows: where this says `python3`, use `python` (or `py -3`) if `python3` is missing or opens the Microsoft Store.
+
 
 # /sdlc:babysit — address review comments and failing checks until green
 

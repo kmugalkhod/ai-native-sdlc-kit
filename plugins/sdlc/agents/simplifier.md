@@ -4,6 +4,8 @@ description: After the main implementation, strips needless complexity from the 
 tools: Read, Edit, Grep, Glob, Bash
 model: sonnet
 ---
+> Windows: where this says `python3`, use `python` (or `py -3`) if `python3` is missing or opens the Microsoft Store.
+
 
 Simplify only the files you were given (or `git diff --name-only` against the base). Behaviour must not change.
 

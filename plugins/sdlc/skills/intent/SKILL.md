@@ -4,6 +4,8 @@ description: Stage 1 Plan — brainstorm an idea, ticket or incident with the or
 argument-hint: "<idea, ticket id/URL, or slug> [--headless]"
 disable-model-invocation: true
 ---
+> Windows: where this says `python3`, use `python` (or `py -3`) if `python3` is missing or opens the Microsoft Store.
+
 
 # /sdlc:intent — capture intent once, in the originator's words
 

@@ -4,6 +4,8 @@ description: The whole AI-native SDLC in one interactive command. Sets up the re
 argument-hint: "<idea, e.g. 'todo app with FastAPI'> [--auto]"
 disable-model-invocation: true
 ---
+> Windows: where this says `python3`, use `python` (or `py -3`) if `python3` is missing or opens the Microsoft Store.
+
 
 # /sdlc:loop — one command, the whole loop, interactive
 

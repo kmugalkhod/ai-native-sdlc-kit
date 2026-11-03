@@ -4,6 +4,8 @@ description: Show where every change sits in the AI-native SDLC loop, what the n
 argument-hint: "[--metrics]"
 disable-model-invocation: true
 ---
+> Windows: where this says `python3`, use `python` (or `py -3`) if `python3` is missing or opens the Microsoft Store.
+
 
 # /sdlc:status
 

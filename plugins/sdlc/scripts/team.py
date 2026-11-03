@@ -24,6 +24,7 @@ Everything is visible live in the board page: python .sdlc/bin/board_server.py
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import os
 import re
@@ -50,9 +51,9 @@ EDIT_TOOLS = ["Edit", "Write", "MultiEdit"]
 SAFE_BASH = ["Bash(python3 .sdlc/bin/*)", "Bash(python .sdlc/bin/*)", "Bash(git status*)", "Bash(git diff*)",
              "Bash(git log*)", "Bash(git show*)", "Bash(git add *)", "Bash(git commit *)", "Bash(ls*)",
              "Bash(cat *)", "Bash(mkdir *)", "Bash(pwd)"]
-DEV_BASH = ["Bash(git merge *)", "Bash(git checkout -- *)", "Bash(.venv/bin/*)", "Bash(python3 -m pytest*)",
+DEV_BASH = ["Bash(git merge *)", "Bash(git checkout -- *)", "Bash(.venv/bin/*)", "Bash(python3 -m pytest*)", "Bash(python -m pytest*)", "Bash(.venv/Scripts/*)",
             "Bash(npm *)", "Bash(npx *)", "Bash(node *)"]
-QA_BASH = ["Bash(curl *)", "Bash(.venv/bin/*)", "Bash(python3 -m pytest*)", "Bash(npx playwright*)"]
+QA_BASH = ["Bash(curl *)", "Bash(.venv/bin/*)", "Bash(python3 -m pytest*)", "Bash(python -m pytest*)", "Bash(.venv/Scripts/*)", "Bash(npx playwright*)"]
 
 
 def log(msg: str) -> None:
@@ -142,7 +143,7 @@ class AgentRun:
                             d = self.describe(blk)
                             if d:
                                 self.b.upsert_agent(self.name, activity=d)
-                                if not d.startswith("$ python3 .sdlc/bin/board.py"):
+                                if not d.startswith(("$ python3 .sdlc/bin/board.py", "$ python .sdlc/bin/board.py")):
                                     self.b.event(self.item_key, self.name, "activity", d)
                         elif blk.get("type") == "text" and blk.get("text", "").strip():
                             self.b.upsert_agent(self.name, activity="💭 " + blk["text"].strip()[:140])
@@ -175,7 +176,7 @@ class SimulatedRun(AgentRun):
         env = {**os.environ, **self.env}
         k = self.item_key
         def board(*args):
-            subprocess.run(["python3", ".sdlc/bin/board.py", *args], cwd=self.cwd, env=env, capture_output=True)
+            subprocess.run([sys.executable, ".sdlc/bin/board.py", *args], cwd=self.cwd, env=env, capture_output=True)
         steps = 3
         for s in range(steps):
             self.b.upsert_agent(self.name, activity=f"{'coding' if self.role == 'developer' else 'testing'} {k} ({s + 1}/{steps})")
@@ -228,7 +229,10 @@ Rules:
 - depends_on uses task ids from this file. No cycles.
 - Each task has testable acceptance criteria and a "qa" note: how a QA agent proves it in a browser or via the API.
 - Mark "ui": true on every task that creates or changes something a user sees (pages, components, styles, copy),
-  and set the top-level "ui" true if the change has any UI. A designer agent designs those before they are built.
+  and set the top-level "ui" true if the change has any UI. A designer agent designs those before they are built,
+  so UI tasks wait for the design approval and everything else starts at once.
+- Keep the skeleton and all backend/API/data tasks "ui": false and free of page, template, CSS or static files:
+  put the first page/HTML shell in a UI task of its own. Otherwise the whole build waits for the design.
 
 Do not write any files. Reply with ONLY the breakdown as one JSON object in a ```json block, exactly this shape:
 {{"epic": {{"title": "...", "description": "..."}}, "ui": true,
@@ -268,12 +272,26 @@ def cmd_plan(root: Path, cfg: dict, a) -> None:
                 sys.exit(f"planner could not produce a valid breakdown: {problem}")
             out.write_text(json.dumps(data, indent=2) + "\n", encoding="utf-8")
     data = json.loads(out.read_text(encoding="utf-8"))
+    problem = validate_breakdown(data)
+    if problem:
+        sys.exit(f"{out.name} is not a valid breakdown: {problem}")
     load_breakdown(root, cfg, change, data, max(1, a.developers if a.developers is not None else cfg["team"]["developers"]))
     if not a.simulate and cfg["pipeline"].get("commit", True):
         git(root, "add", str(out))
         git(root, "commit", "-q", "-m", f"breakdown: {change.name}", "-m", "Epic/stories/tasks for the agent team.")
     sync_once(cfg)
     print_tree(Board())
+
+
+def breakdown_sha(data: dict) -> str:
+    return hashlib.sha1(json.dumps(data, sort_keys=True).encode()).hexdigest()[:12]
+
+
+def board_untouched(b: Board) -> bool:
+    """True while no agent has done any work: nothing past To Do and only the planner has run."""
+    work = [i for i in b.items() if i["type"] in ("task", "design")]
+    return all(i["status"] == "todo" for i in work) and not any(
+        (a["runs"] or 0) > 0 for a in b.agents() if a["name"] != "planner")
 
 
 def validate_breakdown(d: dict) -> str:
@@ -327,13 +345,28 @@ def ui_world(root: Path, cfg: dict) -> tuple[str, str]:
 
 def load_breakdown(root: Path, cfg: dict, change: Path, data: dict, devs: int) -> None:
     b = Board()
+    sha = breakdown_sha(data)
     if b.items(type_="epic"):
-        existing = b.meta().get("change")
-        if existing == change.name:
-            log("board already holds this change — keeping it (use team.py reset to start over)")
+        m = b.meta()
+        existing = m.get("change")
+        if existing == change.name and m.get("breakdown_sha") == sha:
+            log("board already holds this breakdown — keeping it")
             return
-        sys.exit(f"the board holds another change ({existing}); run team.py reset first")
-    b.set_meta(change=change.name, project=root.name, created_at=utcnow(), status="planned",
+        if board_untouched(b):
+            # nothing has been worked on yet, so reloading loses nothing — no human reset needed
+            log(f"breakdown changed and no work has started — reloading the board"
+                + (f" (was {existing})" if existing != change.name else ""))
+            b.clear()
+        elif existing == change.name and m.get("breakdown_sha") is None:
+            b.set_meta(breakdown_sha=sha)  # board from an older kit with work in progress: adopt, keep it
+            return
+        elif existing == change.name:
+            log("breakdown.json changed but agents have already worked on this board — keeping the board. "
+                "To start over, a human runs: python .sdlc/bin/team.py reset")
+            return
+        else:
+            sys.exit(f"the board holds another change ({existing}) with work in progress; a human runs team.py reset first")
+    b.set_meta(change=change.name, project=root.name, created_at=utcnow(), status="planned", breakdown_sha=sha,
                tracker=(cfg.get("tracker") or {}).get("type", "internal"),
                integration_branch=f"{cfg['team']['branch_prefix']}{change.name}")
     e = b.add_item("epic", data["epic"]["title"], description=data["epic"].get("description", ""))
@@ -347,8 +380,21 @@ def load_breakdown(root: Path, cfg: dict, change: Path, data: dict, devs: int) -
             tk = b.add_item("task", t["title"], sk, description=desc, acceptance=t.get("acceptance", []),
                             files=t.get("files", []))
             idmap[t["id"]] = tk
-            is_ui = bool(t.get("ui")) or any(matches_any(f, cfg["team"]["design"]["ui_globs"]) for f in t.get("files", []))
+            # the planner's explicit flag wins; file globs only decide when it said nothing
+            is_ui = bool(t["ui"]) if "ui" in t else \
+                any(matches_any(f, cfg["team"]["design"]["ui_globs"]) for f in t.get("files", []))
             pending.append((tk, t.get("depends_on", []), is_ui))
+    # guard: never hold backend work for the design. A "UI" task that any non-UI task depends on (directly or
+    # through others) is foundation work, e.g. a skeleton with a placeholder page, so it does not wait for D-1.
+    by_id = {idmap[t["id"]]: [idmap[d] for d in t.get("depends_on", []) if d in idmap]
+             for s in data["stories"] for t in s.get("tasks", [])}
+    needed_by_backend, stack = set(), [tk for tk, _d, ui in pending if not ui]
+    while stack:
+        for dep in by_id.get(stack.pop(), []):
+            if dep not in needed_by_backend:
+                needed_by_backend.add(dep); stack.append(dep)
+    freed = [tk for tk, _d, ui in pending if ui and tk in needed_by_backend]
+    pending = [(tk, d, ui and tk not in needed_by_backend) for tk, d, ui in pending]
     # design: a designer agent designs every UI task before it is built (backend tasks don't wait)
     dmode = cfg["team"]["design"]["mode"]
     ui_tasks = [tk for tk, _d, is_ui in pending if is_ui]
@@ -364,6 +410,10 @@ def load_breakdown(root: Path, cfg: dict, change: Path, data: dict, devs: int) -
         b.update(design_key, "lead", assignee="designer")
         b.set_meta(design={"key": design_key, "mode": world, "evidence": evidence, "ui_tasks": ui_tasks})
         b.event(design_key, "lead", "assign", f"{world}: designer designs {len(ui_tasks)} UI task(s) first")
+        if freed:
+            b.event(design_key, "lead", "system", f"{', '.join(freed)} touch UI files but backend work depends on "
+                                                  "them — they start now instead of waiting for the design")
+            log(f"{', '.join(freed)}: backend depends on them — not waiting for the design")
     # dependencies, then a first assignment that spreads the work (the lead rebalances at run time)
     load = {d: 0 for d in dev_names}
     for tk, deps, is_ui in pending:
@@ -537,6 +587,14 @@ font that is not from DESIGN.md; broken responsive layout or horizontal scroll; 
 (more than ~8px or ~20%). Do NOT fail for sub-pixel or few-pixel differences, slightly different icon sizes/stroke
 widths, or anything you only find by measuring with getComputedStyle — list those under "Design nits" in a PASS.
 """
+
+
+# Windows: `python3` is often missing or the Microsoft Store stub, so agents are told to use `python`
+PY = "python" if os.name == "nt" else "python3"
+if PY != "python3":
+    for _n, _v in list(globals().items()):
+        if _n.isupper() and isinstance(_v, str) and "python3 " in _v:
+            globals()[_n] = _v.replace("python3 ", PY + " ")
 
 
 class Lead:
@@ -1035,7 +1093,7 @@ class Lead:
         iwt = self.wt("integration")
         verify_ok = None
         if done and not self.a.simulate and any(self.cfg["verify"].values()):
-            r = sh(["python3", ".sdlc/bin/sdlc.py", "verify"], iwt, timeout=1800)
+            r = sh([sys.executable, ".sdlc/bin/sdlc.py", "verify"], iwt, timeout=1800)
             verify_ok = r.returncode == 0
             self.b.event(None, "lead", "system", f"integration verify: {'PASS' if verify_ok else 'FAIL'}")
         agents = self.b.agents()
@@ -1074,7 +1132,7 @@ def cmd_run(root: Path, cfg: dict, a) -> None:
     b = Board()
     if not b.items(type_="task"):
         log("board is empty — planning first")
-        cmd_plan(root, cfg, a)
+    cmd_plan(root, cfg, a)  # plans if needed; reloads an edited breakdown.json while no work has started
     if b.meta().get("change") != change.name:
         sys.exit(f"the board holds {b.meta().get('change')}; run team.py reset first")
     if not shutil.which("claude") and not a.simulate:
@@ -1099,9 +1157,7 @@ def cmd_status(root: Path, cfg: dict, a) -> None:
 def cmd_reset(root: Path, cfg: dict, a) -> None:
     if os.environ.get("CLAUDECODE") or (not a.yes and not sys.stdin.isatty()):
         sys.exit("reset wipes the board; run it yourself in a terminal (or pass --yes)")
-    p = Board().path
-    for f in (p, Path(str(p) + "-wal"), Path(str(p) + "-shm")):
-        f.unlink(missing_ok=True)
+    Board().clear()  # in place: also works while the board server holds the file open (Windows)
     print("board cleared (worktrees and branches are kept; remove them with `git worktree remove`)")
 
 

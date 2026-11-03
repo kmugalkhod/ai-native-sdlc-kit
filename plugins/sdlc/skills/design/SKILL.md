@@ -4,6 +4,8 @@ description: Design the UI for an accepted change before it is built — greenfi
 argument-hint: "<change> [--greenfield|--brownfield]"
 disable-model-invocation: true
 ---
+> Windows: where this says `python3`, use `python` (or `py -3`) if `python3` is missing or opens the Microsoft Store.
+
 
 # /sdlc:design — design first, then build
 

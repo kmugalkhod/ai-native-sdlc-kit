@@ -4,6 +4,8 @@ description: Stage 6 Maintain — diagnose an alert, band breach, incident messa
 argument-hint: "<alert text, metric, ticket or channel message> [--headless] [--alert '<json from monitor>']"
 disable-model-invocation: true
 ---
+> Windows: where this says `python3`, use `python` (or `py -3`) if `python3` is missing or opens the Microsoft Store.
+
 
 # /sdlc:triage — the loop closes: findings re-enter as intent.md
 

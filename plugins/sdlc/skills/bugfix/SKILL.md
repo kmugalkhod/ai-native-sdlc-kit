@@ -4,6 +4,8 @@ description: Stage 4 Test — fix a bug failing-test-first. Reproduce it as a te
 argument-hint: "<bug description, ticket id, or log excerpt>"
 disable-model-invocation: true
 ---
+> Windows: where this says `python3`, use `python` (or `py -3`) if `python3` is missing or opens the Microsoft Store.
+
 
 # /sdlc:bugfix — the test that existed before the fix is the proof
 

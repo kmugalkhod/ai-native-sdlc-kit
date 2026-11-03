@@ -248,6 +248,12 @@ class Board:
                     qa_rounds=(it.get("qa_rounds") or 0) + 1, qa_by=f"changes:{actor}")
         self.send(actor, "designer", f"Changes requested on {key}: {text}", key)
 
+    def clear(self) -> None:
+        """Empty every table in place (works while the board server has the file open, incl. on Windows)."""
+        with self.conn() as c:
+            for t in ("events", "messages", "agents", "items", "meta"):
+                c.execute(f"DELETE FROM {t}")
+
     def resume(self, key: str, text: str, actor: str = "human") -> None:
         """Human sends an escalated task back to the team with guidance; counters start over."""
         it = self.item(key) or {}

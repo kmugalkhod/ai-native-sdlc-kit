@@ -4,6 +4,8 @@ description: Run the agent-configuration eval suite, or add a new eval case from
 argument-hint: "run [--case ID] | add <task, PR, or incident>"
 disable-model-invocation: true
 ---
+> Windows: where this says `python3`, use `python` (or `py -3`) if `python3` is missing or opens the Microsoft Store.
+
 
 # /sdlc:evals
 

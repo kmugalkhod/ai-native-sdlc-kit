@@ -4,6 +4,8 @@ description: Stage 3 Build (plan mode) — read the accepted spec and the codeba
 argument-hint: "<change folder or substring> [--headless]"
 disable-model-invocation: true
 ---
+> Windows: where this says `python3`, use `python` (or `py -3`) if `python3` is missing or opens the Microsoft Store.
+
 
 # /sdlc:plan — nothing is implemented without an accepted plan
 

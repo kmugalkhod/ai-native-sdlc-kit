@@ -4,6 +4,8 @@ description: Set up the AI-Native SDLC in the current repo — artifact folders,
 argument-hint: "[github|gitlab|none]"
 disable-model-invocation: true
 ---
+> Windows: where this says `python3`, use `python` (or `py -3`) if `python3` is missing or opens the Microsoft Store.
+
 
 # /sdlc:init — install the loop into this repo
 

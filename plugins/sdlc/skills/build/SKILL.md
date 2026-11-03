@@ -4,6 +4,8 @@ description: Stage 3/4 Build+Test — implement an accepted plan.md with a feedb
 argument-hint: "<change folder or substring> [--headless]"
 disable-model-invocation: true
 ---
+> Windows: where this says `python3`, use `python` (or `py -3`) if `python3` is missing or opens the Microsoft Store.
+
 
 # /sdlc:build — implement against the plan, prove it with the toolchain
 

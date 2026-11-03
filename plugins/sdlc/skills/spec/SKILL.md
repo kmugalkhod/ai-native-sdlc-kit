@@ -4,6 +4,8 @@ description: Stage 2 Design — turn an accepted intent.md into a requirements-a
 argument-hint: "<change folder or substring> [--headless]"
 disable-model-invocation: true
 ---
+> Windows: where this says `python3`, use `python` (or `py -3`) if `python3` is missing or opens the Microsoft Store.
+
 
 # /sdlc:spec — requirements and design in one session
 

@@ -2,6 +2,8 @@
 name: sdlc-artifacts
 description: Conventions for the AI-native SDLC artifacts. Use whenever reading, writing or reasoning about intent.md, spec.md, plan.md, review.md, ESCALATION.md, lessons, or anything under sdlc/changes/ or .sdlc/.
 ---
+> Windows: where this says `python3`, use `python` (or `py -3`) if `python3` is missing or opens the Microsoft Store.
+
 
 # AI-native SDLC artifact conventions
 

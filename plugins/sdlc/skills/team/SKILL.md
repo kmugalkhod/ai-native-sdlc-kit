@@ -4,6 +4,8 @@ description: Build an accepted change with an agent team — Epic → Stories �
 argument-hint: "<change> [--developers N] [--qa M] [--simulate]"
 disable-model-invocation: true
 ---
+> Windows: where this says `python3`, use `python` (or `py -3`) if `python3` is missing or opens the Microsoft Store.
+
 
 # /sdlc:team — a squad of agents on one change
 

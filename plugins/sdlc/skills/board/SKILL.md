@@ -4,6 +4,8 @@ description: Open the live team board — kanban of tasks, epic/story/task tree,
 argument-hint: "[--port N]"
 disable-model-invocation: true
 ---
+> Windows: where this says `python3`, use `python` (or `py -3`) if `python3` is missing or opens the Microsoft Store.
+
 
 # /sdlc:board
 
