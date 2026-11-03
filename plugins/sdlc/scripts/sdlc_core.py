@@ -57,6 +57,7 @@ DEFAULTS: dict = {
         "models": {"planner": "sonnet", "developer": "sonnet", "qa": "sonnet", "helper": "sonnet",
                    "designer": "sonnet"},
         "max_qa_rounds": 3, "max_dev_attempts": 2, "max_help_rounds": 2, "run_timeout_minutes": 40,
+        "stall_minutes": 12,
         "branch_prefix": "team/", "worktree_dir": ".sdlc/worktrees",
         "allowed_bash": [],
         "qa": {"start_cmd": "", "health_path": "/", "port_base": 8600, "start_timeout": 60,
@@ -223,3 +224,27 @@ def setup_signature(root: Path, cmd: str) -> str:
             h.update(b"venv" if (root / venv).is_dir() else b"no-venv")
     return h.hexdigest() if seen else ""
 
+
+_NPM_PREFIX_INSTALL = re.compile(
+    r"npm\s+(?:--prefix[ =]|-C\s+)([^\s&|;]+)\s+((?:install|i|ci)\b[^&|;]*)"     # npm --prefix DIR install ...
+    r"|npm\s+((?:install|i|ci)\b[^&|;]*?)\s+--prefix[ =]([^\s&|;]+)([^&|;]*)")       # npm install ... --prefix DIR
+
+
+def portable_cmd(cmd: str) -> str:
+    """Make a configured command work on this OS without the user editing config.
+    - `npm --prefix DIR install` is unreliable (on Windows npm looks for package.json in the current folder):
+      run it inside DIR instead, with pushd/popd so later commands still start from the repo root (bash and cmd).
+    - Windows virtualenvs keep executables in .venv\\Scripts, not .venv/bin."""
+    def fix(m: re.Match) -> str:
+        if m.group(1):
+            d, rest = m.group(1), m.group(2).strip()
+        else:
+            d, rest = m.group(4), (m.group(3) + (m.group(5) or "")).strip()
+        tail = " " if m.group(0)[-1:].isspace() else ""
+        if os.name == "nt":  # cmd.exe has no subshell; pushd/popd puts later commands back at the repo root
+            return f"pushd {d} && npm {rest} && popd{tail}"
+        return f"(cd {d} && npm {rest}){tail}"
+    cmd = _NPM_PREFIX_INSTALL.sub(fix, cmd)
+    if os.name == "nt":
+        cmd = re.sub(r"(\.?venv)/bin/", r"\1\\Scripts\\", cmd)
+    return cmd

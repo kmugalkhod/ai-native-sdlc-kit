@@ -26,7 +26,7 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 from sdlc_core import (audit, changes, find_root, git, header_field, load_config, read_state,  # noqa: E402
-                       setup_signature, stage_of, state_path, utcnow)
+                       portable_cmd, setup_signature, stage_of, state_path, utcnow)
 
 NEXT_STEP = {
     "intent": "product owner reviews intent.md, sets Status: accepted -> /sdlc:spec",
@@ -136,8 +136,9 @@ def cmd_verify(root: Path, cfg: dict, a) -> None:
                 print(f"\n=== setup: SKIP (dependencies unchanged since the last install; "
                       f"`verify setup` forces it)", flush=True)
                 continue
-        print(f"\n=== {k}: {cmd}", flush=True)
-        r = subprocess.run(cmd, shell=True, cwd=root)
+        run_cmd = portable_cmd(cmd)
+        print(f"\n=== {k}: {run_cmd}", flush=True)
+        r = subprocess.run(run_cmd, shell=True, cwd=root)
         print(f"=== {k}: {'PASS' if r.returncode == 0 else f'FAIL (exit {r.returncode})'}", flush=True)
         if r.returncode:
             failed.append(k)

@@ -44,7 +44,7 @@ The user can also click Approve / Request changes on the board page.
 For the impeccable skill: `/plugin marketplace add pbakaus/impeccable` then `/plugin install impeccable@impeccable` (or list a local plugin folder in `team.design.plugin_dirs`).
 
 ## 4. While it runs
-Do not poll in a loop. When the user asks, or when the run finishes, run `python3 .sdlc/bin/team.py status` and summarise in a few lines: tasks done/total, who is on what, QA bounces, escalations waiting for a human (and what they need).
+Do not poll in a loop. When the user asks ("is it running?", "what's happening?"), or when the run finishes, run ONLY `python3 .sdlc/bin/team.py status` — it is instant and has everything — and the board URL is always `http://127.0.0.1:<team.board_port in .sdlc/config.json, default 8765>`. Never search for processes, ports or state files (no netstat/Get-NetTCPConnection/ps). Summarise the status in a few lines: tasks done/total, who is on what, QA bounces, escalations waiting for a human (and what they need).
 
 ## 5. When it finishes
 - Exit 0: everything merged into `team/<change>`, integration verify ran, `team-report.md` committed. Offer `/sdlc:review <change>` on that branch, then a PR/MR (ask before pushing).

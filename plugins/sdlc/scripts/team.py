@@ -43,7 +43,7 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 from board import Board, STATUS_LABEL  # noqa: E402
 from sdlc_core import (audit, changes, find_root, git, header_field, load_config, matches_any,  # noqa: E402
-                       setup_signature, utcnow)
+                       portable_cmd, setup_signature, utcnow)
 import trackers  # noqa: E402
 
 BOARD_CLI = "python3 .sdlc/bin/board.py"
@@ -64,6 +64,32 @@ def log(msg: str) -> None:
 def sh(cmd, cwd, timeout=600, env=None) -> subprocess.CompletedProcess:
     return subprocess.run(cmd, cwd=cwd, shell=isinstance(cmd, str), capture_output=True, text=True, encoding="utf-8", errors="replace",
                           timeout=timeout, env=env)
+
+
+NEW_GROUP = ({"creationflags": subprocess.CREATE_NEW_PROCESS_GROUP} if os.name == "nt" else {"start_new_session": True})
+
+
+def kill_tree(proc) -> None:
+    """Kill a process and everything it started. On Windows terminate() leaves the children (npm, node, uvicorn)
+    running, still holding file locks and ports."""
+    if not proc or proc.poll() is not None:
+        return
+    try:
+        if os.name == "nt":
+            subprocess.run(["taskkill", "/PID", str(proc.pid), "/T", "/F"], capture_output=True, timeout=30)
+        else:
+            os.killpg(proc.pid, signal.SIGKILL)
+    except Exception:
+        try:
+            proc.kill()
+        except Exception:
+            pass
+
+
+def port_free(port: int) -> bool:
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as so:
+        so.settimeout(0.5)
+        return so.connect_ex(("127.0.0.1", port)) != 0
 
 
 def resolve_change(root: Path, cfg: dict, name: str) -> Path:
@@ -89,9 +115,10 @@ class AgentRun:
 
     def __init__(self, board: Board, name: str, cwd: Path, prompt: str, model: str, tools: list[str],
                  item_key: str | None, timeout_min: int, mcp: dict | None = None, extra_env: dict | None = None,
-                 add_dirs: list[str] | None = None, plugin_dir: str | list | None = None):
+                 add_dirs: list[str] | None = None, plugin_dir: str | list | None = None, stall_min: float = 12):
         self.b, self.name, self.cwd, self.item_key = board, name, cwd, item_key
-        self.cmd = ["claude", "-p", prompt, "--model", model, "--output-format", "stream-json", "--verbose",
+        self.prompt = prompt
+        self.cmd = ["claude", "-p", "--model", model, "--output-format", "stream-json", "--verbose",
                     "--permission-mode", "acceptEdits", "--allowedTools", *tools,
                     "--disallowedTools", "Bash(git push*)"]
         if mcp:
@@ -105,6 +132,7 @@ class AgentRun:
                 self.cmd += ["--plugin-dir", d]
         self.env = {**os.environ, "PYTHONIOENCODING": "utf-8", "PYTHONUTF8": "1", **(extra_env or {})}
         self.timeout = timeout_min * 60
+        self.stall_min = float(stall_min)
         self.proc: subprocess.Popen | None = None
         self.result_text, self.cost, self.error = "", 0.0, None
 
@@ -125,45 +153,73 @@ class AgentRun:
         return None
 
     def run(self) -> None:
-        started = time.time()
-        try:
-            self.proc = subprocess.Popen(self.cmd, cwd=self.cwd, env=self.env, stdout=subprocess.PIPE,
-                                         stderr=subprocess.PIPE, text=True, encoding="utf-8", errors="replace", bufsize=1)
-            for line in self.proc.stdout:
-                if time.time() - started > self.timeout:
+        started = last = time.time()
+        log_dir = Path(self.b.path).parent / "logs"
+        log_dir.mkdir(parents=True, exist_ok=True)
+        err_path = log_dir / f"{self.name}-{self.item_key or 'x'}-{time.strftime('%Y%m%d-%H%M%S')}.stderr.log"
+        stall = int(self.stall_min * 60)
+        done = threading.Event()
+
+        def watchdog():  # enforces the limits even when the agent is silent (e.g. a hung npm/pip command)
+            while not done.wait(5):
+                now = time.time()
+                if now - started > self.timeout:
                     self.error = f"timed out after {self.timeout // 60} min"
-                    self.proc.kill()
-                    break
-                try:
-                    ev = json.loads(line)
-                except json.JSONDecodeError:
+                elif stall and now - last > stall:
+                    self.error = f"stalled: no activity for {stall // 60} min (a command probably hung)"
+                else:
                     continue
-                if ev.get("type") == "assistant":
-                    for blk in (ev.get("message") or {}).get("content") or []:
-                        if blk.get("type") == "tool_use":
-                            d = self.describe(blk)
-                            if d:
-                                self.b.upsert_agent(self.name, activity=d)
-                                if not d.startswith(("$ python3 .sdlc/bin/board.py", "$ python .sdlc/bin/board.py")):
-                                    self.b.event(self.item_key, self.name, "activity", d)
-                        elif blk.get("type") == "text" and blk.get("text", "").strip():
-                            self.b.upsert_agent(self.name, activity="💭 " + blk["text"].strip()[:140])
-                elif ev.get("type") == "result":
-                    self.result_text = ev.get("result") or ""
-                    self.cost = ev.get("total_cost_usd") or 0.0
-                    if ev.get("is_error"):
-                        self.error = (self.result_text or "claude reported an error")[:500]
-            self.proc.wait(timeout=30)
+                kill_tree(self.proc)
+                return
+        try:
+            exe = shutil.which(self.cmd[0]) or self.cmd[0]
+            with open(err_path, "w", encoding="utf-8", errors="replace") as err:
+                self.proc = subprocess.Popen([exe, *self.cmd[1:]], cwd=self.cwd, env=self.env, stdin=subprocess.PIPE,
+                                             stdout=subprocess.PIPE, stderr=err, text=True, encoding="utf-8",
+                                             errors="replace", bufsize=1, **NEW_GROUP)
+                threading.Thread(target=watchdog, daemon=True).start()
+                try:  # the prompt goes in on stdin: no command-line length limit (cmd.exe stops at 8191 chars)
+                    self.proc.stdin.write(self.prompt)
+                    self.proc.stdin.close()
+                except OSError:
+                    pass
+                for line in self.proc.stdout:
+                    last = time.time()
+                    try:
+                        ev = json.loads(line)
+                    except json.JSONDecodeError:
+                        continue
+                    if ev.get("type") == "assistant":
+                        for blk in (ev.get("message") or {}).get("content") or []:
+                            if blk.get("type") == "tool_use":
+                                d = self.describe(blk)
+                                if d:
+                                    self.b.upsert_agent(self.name, activity=d)
+                                    if not d.startswith(("$ python3 .sdlc/bin/board.py", "$ python .sdlc/bin/board.py")):
+                                        self.b.event(self.item_key, self.name, "activity", d)
+                            elif blk.get("type") == "text" and blk.get("text", "").strip():
+                                self.b.upsert_agent(self.name, activity="💭 " + blk["text"].strip()[:140])
+                    elif ev.get("type") == "result":
+                        self.result_text = ev.get("result") or ""
+                        self.cost = ev.get("total_cost_usd") or 0.0
+                        if ev.get("is_error"):
+                            self.error = (self.result_text or "claude reported an error")[:500]
+                try:
+                    self.proc.wait(timeout=30)
+                except subprocess.TimeoutExpired:
+                    kill_tree(self.proc)
             if self.proc.returncode and not self.error:
-                self.error = (self.proc.stderr.read() or f"exit {self.proc.returncode}")[-500:]
+                tail = err_path.read_text(encoding="utf-8", errors="replace")[-500:].strip()
+                self.error = tail or f"exit {self.proc.returncode}"
         except Exception as e:  # never let one agent crash the team
             self.error = str(e)[:500]
         finally:
+            done.set()
+            kill_tree(self.proc)  # leftover children (npm, node, uvicorn, browsers) must not hold locks or ports
             self.b.add_cost(self.name, self.cost)
 
     def stop(self) -> None:
-        if self.proc and self.proc.poll() is None:
-            self.proc.terminate()
+        kill_tree(self.proc)
 
 
 class SimulatedRun(AgentRun):
@@ -232,6 +288,8 @@ Rules:
   skeleton tasks with no dependency between them, and let each later task depend only on the skeleton it builds on.
 - depends_on uses task ids from this file. No cycles.
 - Each task has testable acceptance criteria and a "qa" note: how a QA agent proves it in a browser or via the API.
+  For pure setup tasks with nothing a user can try (skeleton, config, tooling, CI), set "qa": "none" — the lead
+  checks those with verify instead of a QA agent.
 - Mark "ui": true on every task that creates or changes something a user sees (pages, components, styles, copy),
   and set the top-level "ui" true if the change has any UI. A designer agent designs those before they are built,
   so UI tasks wait for the design approval and everything else starts at once.
@@ -375,7 +433,7 @@ def load_breakdown(root: Path, cfg: dict, change: Path, data: dict, devs: int) -
                integration_branch=f"{cfg['team']['branch_prefix']}{change.name}")
     e = b.add_item("epic", data["epic"]["title"], description=data["epic"].get("description", ""))
     idmap, dev_names = {}, [f"dev-{i + 1}" for i in range(devs)]
-    pending = []
+    pending, no_qa = [], []
     for s in data["stories"]:
         sk = b.add_item("story", s["title"], e, description=s.get("description", ""),
                         acceptance=s.get("acceptance", []))
@@ -388,6 +446,8 @@ def load_breakdown(root: Path, cfg: dict, change: Path, data: dict, devs: int) -
             is_ui = bool(t["ui"]) if "ui" in t else \
                 any(matches_any(f, cfg["team"]["design"]["ui_globs"]) for f in t.get("files", []))
             pending.append((tk, t.get("depends_on", []), is_ui))
+            if str(t.get("qa", "")).strip().lower() in ("none", "skip", "-", "n/a") and not is_ui:
+                no_qa.append(tk)
     # guard: the foundation task must never wait for the design. A "UI" task with no dependencies of its own that
     # non-UI tasks build on directly (typically the skeleton with a placeholder page) starts at once. Real screens
     # (app shell, pages) depend on something, so they keep waiting for the approved design.
@@ -428,6 +488,7 @@ def load_breakdown(root: Path, cfg: dict, change: Path, data: dict, devs: int) -
         load[owner] += 1
         b.update(tk, "lead", depends_on=json.dumps(keys), assignee=owner)
         b.event(tk, "lead", "assign", f"assigned to {owner}")
+    b.set_meta(no_qa=no_qa)
     b.event(None, "lead", "system", f"plan loaded: {len(data['stories'])} stories, {len(pending)} tasks, "
                                     f"{devs} developers" + (f", design {design_key} first for {len(ui_tasks)} UI task(s)"
                                                             if design_key else ", no UI — no designer needed"))
@@ -482,12 +543,14 @@ Files you own for this task: {files}
 Acceptance criteria:
 {acceptance}
 
-It belongs to story {story_key} "{story_title}" of epic "{epic_title}". For the big picture read
-{rel}/intent.md, {rel}/spec.md, {rel}/plan.md and {rel}/breakdown.json. Follow CLAUDE.md.
+It belongs to story {story_key} "{story_title}" of epic "{epic_title}". Everything you need is above; look things up
+in {rel}/spec.md or {rel}/plan.md only when a detail is missing (search them, don't read them whole). Follow CLAUDE.md.
 {extra}
 How to work:
 1. Check messages first: {cli} inbox  (check again after each major step — teammates may answer you).
-2. Implement the task. New packages go into the manifest (requirements.txt / package.json) and are installed by
+2. Implement the task. Scaffolding (a new frontend/backend project, config files) comes from the official
+   generators — e.g. `npm create vite@latest frontend -- --template react-ts`, then adjust — instead of typing every
+   file yourself. New packages go into the manifest (requirements.txt / package.json) and are installed by
    `python3 .sdlc/bin/sdlc.py verify setup` — never pip/npm install by hand.
 3. Write or extend tests for the acceptance criteria. While iterating run only the narrowest check (one test file,
    e.g. `python3 -m pytest tests/test_x.py -q`, or one npm script). Run the full `python3 .sdlc/bin/sdlc.py verify`
@@ -510,7 +573,9 @@ Story {story_key} "{story_title}" acceptance: {story_acceptance}
 The code is checked out in your own worktree {wt} (branch {branch}).
 {app}
 Do this:
-1. {cli} inbox — then run `python3 .sdlc/bin/sdlc.py verify` (setup, build, tests, lint).
+1. {cli} inbox — then run `python3 .sdlc/bin/sdlc.py verify` (setup, build, tests, lint). If it fails because the
+   toolchain itself is broken (pip/npm install errors, missing tools) — not because of the code — do NOT debug or
+   work around it: `{cli} blocked {key} "verify setup fails: <the error>"` and stop. A human fixes the config.
 2. Test every acceptance criterion the way a user would. {browser}
    For APIs use curl. Try the edge cases a careful tester would (empty input, bad input, refresh, repeat).
 3. If a criterion has no automated test, add one under tests/ (e2e or API) and commit it:
@@ -622,6 +687,7 @@ class Lead:
         self.attempts: dict[str, int] = {}
         self.help_rounds: dict[str, int] = {}
         self.escalated: set[str] = set(self.b.meta().get("escalated", []))
+        self.pending: list[tuple] = []  # results from background prep threads, applied by the lead thread
         self.stop = threading.Event()
         try:
             self.tracker = trackers.make(cfg)
@@ -659,6 +725,15 @@ class Lead:
             if role:
                 self.b.upsert_agent(name, role=role, status="idle", item_key=None, activity="ready",
                                     worktree=str(p.relative_to(self.root)))
+        # a previous run that died (crash, Ctrl+C, closed terminal) can leave QA claims nobody holds: no agent is
+        # running yet, so every bare claim is stale — release it so QA picks the task up again
+        for t in self.b.items(type_="task"):
+            claim = t.get("qa_by") or ""
+            if t["status"] == "in_qa" and claim and ":" not in claim:
+                self.b.update(t["key"], "lead", qa_by=None)
+                self.b.event(t["key"], "lead", "system", f"released stale QA claim by {claim} from an earlier run")
+                log(f"{t['key']}: released stale QA claim by {claim}")
+        self.sync_bin()
         self.b.set_meta(status="running", started_at=utcnow(), integration_branch=self.integration,
                         team={"developers": self.devs, "qa": self.qas, "designers": self.designers})
         if self.design:
@@ -722,9 +797,38 @@ class Lead:
     def tasks(self) -> list[dict]:
         return self.b.items(type_="task")
 
+    def sync_bin(self) -> None:
+        """Agents run the helper scripts from their own worktree, i.e. from the team branch. After the human upgrades
+        the kit (init.py --upgrade-bin), copy the new scripts into the team branch so every new task uses them."""
+        src, iwt = self.root / ".sdlc" / "bin", self.wt("integration")
+        dst = iwt / ".sdlc" / "bin"
+        if not src.is_dir():
+            return
+        changed = []
+        for f in sorted(src.glob("*.py")):
+            target = dst / f.name
+            if not target.exists() or target.read_bytes() != f.read_bytes():
+                dst.mkdir(parents=True, exist_ok=True)
+                shutil.copy2(f, target)
+                changed.append(f.name)
+        if changed:
+            sh(["git", "add", ".sdlc/bin"], iwt)
+            sh(["git", "-c", "user.name=team-lead", "-c", "user.email=lead@sdlc.local", "commit", "-qm",
+                "sdlc: update kit scripts on the team branch"], iwt)
+            log(f"updated kit scripts on {self.integration}: {', '.join(changed)}")
+            self.b.event(None, "lead", "system", f"kit scripts updated on the team branch ({len(changed)} files)")
+
+    def has_work(self, t: dict, wt: Path) -> bool:
+        """The task's branch already carries commits beyond the integration branch and nothing sent it back."""
+        if not t.get("branch") or t["status"] != "in_progress" or t.get("qa_rounds"):
+            return False
+        n = sh(["git", "rev-list", "--count", f"{self.integration}..{t['branch']}"], wt).stdout.strip()
+        return n.isdigit() and int(n) > 0
+
     def busy(self, agent: str) -> bool:
         w = getattr(self, "warming", {}).get(agent)
-        return agent in self.running or bool(w and w.is_alive())
+        queued = any(j[0] == "qa" and j[1] == agent for j in getattr(self, "pending", []))
+        return agent in self.running or bool(w and w.is_alive()) or queued
 
     def warm(self, names: list[str]) -> None:
         """Install dependencies in idle agents' worktrees in the background, so agents don't spend their own time
@@ -786,6 +890,7 @@ class Lead:
             run = AgentRun(self.b, agent, cwd, prompt, model, self.tools_for(role), t["key"],
                            self.t["run_timeout_minutes"], mcp=self.mcp_for(role, port),
                            extra_env=self.env_for(agent, role), add_dirs=add_dirs,
+                           stall_min=self.t.get("stall_minutes", 12),
                            plugin_dir=[os.environ.get("SDLC_PLUGIN_DIR")] +
                                       (list(self.d.get("plugin_dirs") or []) if role == "designer" else []))
         th = threading.Thread(target=run.run, daemon=True, name=f"{agent}:{t['key']}")
@@ -813,7 +918,7 @@ class Lead:
             return
         others = ", ".join(n for n in self.devs + self.qas if n != agent)
         extra = ""
-        if self.attempts.get(t["key"]):
+        if self.attempts.get(t["key"]) or self.has_work(t, wt):
             extra += ("\nYOUR PREVIOUS RUN ON THIS TASK STOPPED (time limit or exit) BEFORE YOU SUBMITTED. Its work is "
                       "committed on your branch: read `git log --oneline -5` and `git diff " + self.integration + " --stat`, "
                       "CONTINUE from it — do not start over — get verify green and submit.\n")
@@ -837,17 +942,33 @@ class Lead:
                     self.t["models"]["developer"], behaviour=behaviour)
 
     def start_qa(self, agent: str, t: dict) -> None:
-        wt = self.wt(agent)
-        qa_branch = f"qa/{t['key']}"
-        sh("git reset -q --hard && git clean -qfd", wt)
-        r = sh(["git", "checkout", "-q", "-B", qa_branch, t["branch"]], wt)
-        if r.returncode:
-            self.escalate(t, f"QA could not check out {t['branch']}: {r.stderr.strip()[:200]}")
-            return
-        port = self.t["qa"]["port_base"] + self.qas.index(agent)
-        app = self.start_app(agent, wt, port)
+        """Claim the task now; check out, install and start the app in the background so the lead keeps
+        dispatching developers and merging while QA gets ready."""
         self.b.update(t["key"], "lead", qa_by=agent)
         self.b.event(t["key"], "lead", "assign", f"QA {agent} picked up {t['key']} from {t['assignee']}")
+        self.b.upsert_agent(agent, status="working", item_key=t["key"], activity="preparing: checkout, install, start app")
+        self.warming = getattr(self, "warming", {})
+
+        def prep():
+            try:
+                wt, qa_branch = self.wt(agent), f"qa/{t['key']}"
+                sh("git reset -q --hard && git clean -qfd", wt)
+                r = sh(["git", "checkout", "-q", "-B", qa_branch, t["branch"]], wt)
+                if r.returncode:
+                    self.pending.append(("escalate", t["key"], f"QA could not check out {t['branch']}: {r.stderr.strip()[:200]}"))
+                    return
+                port = self.t["qa"]["port_base"] + self.qas.index(agent)
+                app = self.start_app(agent, wt, port)
+                self.pending.append(("qa", agent, t["key"], qa_branch, app))
+            except Exception as e:
+                self.pending.append(("escalate", t["key"], f"QA preparation failed: {e}"))
+        th = threading.Thread(target=prep, daemon=True, name=f"{agent}:prep:{t['key']}")
+        th.start()
+        self.warming[agent] = th
+
+    def launch_qa(self, agent: str, key: str, qa_branch: str, app: str | None) -> None:
+        t = self.b.item(key)
+        wt = self.wt(agent)
         browser = ("Use the browser tools (mcp__playwright__browser_navigate, browser_snapshot, browser_click, "
                    "browser_type, browser_take_screenshot) against the running app."
                    if self.t["qa"].get("browser") == "playwright-mcp" else
@@ -860,7 +981,54 @@ class Lead:
         prompt = QA_PROMPT.format(**ctx)
         if self.design and self.design["key"] in t["depends_on"]:
             prompt += DESIGN_FOR_QA.format(mockup_url=self.mockup_url())
+        port = int(app.split(":")[2].split()[0].split("/")[0]) if app else None
         self.launch(agent, "qa", "qa", t, prompt, wt, self.t["models"]["qa"], port=port, behaviour=behaviour)
+
+    def lead_check(self, t: dict) -> None:
+        """Verify a no-QA task in its developer's worktree (still on the task branch) in the background."""
+        agent = t["assignee"]
+        self.b.update(t["key"], "lead", qa_by="lead")
+        self.b.event(t["key"], "lead", "assign", f"setup task — the lead verifies {t['key']} (no QA agent needed)")
+        self.warming = getattr(self, "warming", {})
+
+        def job():
+            wt = self.wt(agent)
+            if self.a.simulate or not any((self.cfg.get("verify") or {}).values()):
+                self.pending.append(("checked", t["key"], True, "no verify commands configured"))
+                return
+            sh(["git", "checkout", "-q", t["branch"]], wt)
+            env = {**os.environ, "PYTHONIOENCODING": "utf-8"}
+            r = sh([sys.executable, ".sdlc/bin/sdlc.py", "verify"], wt, timeout=1800, env=env)
+            self.pending.append(("checked", t["key"], r.returncode == 0, (r.stdout + r.stderr).strip()[-600:]))
+        th = threading.Thread(target=job, daemon=True, name=f"lead:check:{t['key']}")
+        th.start()
+        self.warming[agent] = th  # keeps the developer's worktree on this branch until the check is done
+
+    def drain(self) -> None:
+        """Apply results that background preparation threads queued (only the lead thread touches dispatch)."""
+        while self.pending:
+            job = self.pending.pop(0)
+            if job[0] == "qa":
+                _, agent, key, qa_branch, app = job
+                self.launch_qa(agent, key, qa_branch, app)
+            elif job[0] == "checked":
+                _, key, ok, out = job
+                t = self.b.item(key)
+                if not t or t["status"] != "in_qa":
+                    continue
+                if ok:
+                    self.b.event(key, "lead", "qa", "PASS: setup task — verify green (checked by the lead)")
+                    self.b.update(key, "lead", qa_by="pass:lead")  # merged on the next tick
+                else:
+                    self.b.event(key, "lead", "qa", f"FAIL: verify is not green on {t['branch']}: {out}")
+                    self.b.update(key, "lead", note="verify failed in the lead's check", status="in_progress",
+                                  qa_rounds=(t.get("qa_rounds") or 0) + 1, qa_by="fail:lead")
+                    if t["assignee"]:
+                        self.b.send("lead", t["assignee"], f"{key}: verify failed when I checked it:\n{out}", key)
+            elif job[0] == "escalate":
+                t = self.b.item(job[1])
+                if t:
+                    self.escalate(t, job[2])
 
     def start_design(self, d: dict) -> None:
         agent, wt = "designer", self.wt("designer")
@@ -881,7 +1049,7 @@ class Lead:
                    if e["kind"] == "design" and e["text"].startswith("CHANGES:")]
         feedback = (f"\nTHE HUMAN ASKED FOR CHANGES (round {len(changes)}): {changes[-1]}\n"
                     "Update the design (keep what they did not mention), then design-ready again.\n") if changes else ""
-        if self.attempts.get(d["key"]) and not changes:
+        if (self.attempts.get(d["key"]) or self.has_work(d, wt)) and not changes:
             feedback += ("\nYOUR PREVIOUS RUN STOPPED BEFORE design-ready. Your files are committed in this worktree "
                          "(DESIGN.md, the mockup, the notes): check what is missing, finish only that, then commit and "
                          "run design-ready right away.\n")
@@ -912,16 +1080,22 @@ class Lead:
         cmd = (self.t["qa"].get("start_cmd") or "").strip()
         if not cmd or self.a.simulate:
             return None
-        setup = self.cfg["verify"].get("setup")
-        if setup:
-            sh(setup, wt, timeout=900)
-        proc = subprocess.Popen(cmd.replace("{port}", str(port)), shell=True, cwd=wt, stdout=subprocess.DEVNULL,
-                                stderr=subprocess.DEVNULL, env={**os.environ, "PORT": str(port)}, start_new_session=True)
+        if self.cfg["verify"].get("setup"):  # cached: a no-op when the worktree's dependencies are already installed
+            env = {**os.environ, "SDLC_SETUP_IF_CHANGED": "1", "PYTHONIOENCODING": "utf-8"}
+            sh([sys.executable, ".sdlc/bin/sdlc.py", "verify", "setup"], wt, timeout=1800, env=env)
+        for cand in [port + 10 * i for i in range(10)]:  # a crashed run may have left an app on the port
+            if port_free(cand):
+                port = cand
+                break
+        proc = subprocess.Popen(portable_cmd(cmd).replace("{port}", str(port)), shell=True, cwd=wt, stdout=subprocess.DEVNULL,
+                                stderr=subprocess.DEVNULL, env={**os.environ, "PORT": str(port)}, **NEW_GROUP)
         self.apps = getattr(self, "apps", {})
         self.apps[agent] = proc
         url = f"http://127.0.0.1:{port}"
         deadline = time.time() + self.t["qa"].get("start_timeout", 60)
         while time.time() < deadline:
+            if proc.poll() is not None:
+                return url + " (the app exited at startup — check start_cmd; report that in your verdict)"
             try:
                 urllib.request.urlopen(url + self.t["qa"].get("health_path", "/"), timeout=2)
                 return url
@@ -933,12 +1107,7 @@ class Lead:
         return url + " (it did not answer the health check — report that if it stays down)"
 
     def stop_app(self, agent: str) -> None:
-        p = getattr(self, "apps", {}).pop(agent, None)
-        if p and p.poll() is None:
-            try:
-                os.killpg(p.pid, signal.SIGTERM)
-            except Exception:
-                p.terminate()
+        kill_tree(getattr(self, "apps", {}).pop(agent, None))
 
     # ---------------------------------------------------------------- after a run
     def finished(self, agent: str) -> None:
@@ -1034,6 +1203,7 @@ class Lead:
     # ---------------------------------------------------------------- the loop
     def tick(self) -> None:
         self.escalated = set(self.b.meta().get("escalated", []))  # the human may resume one from the board
+        self.drain()
         for agent, (th, *_rest) in list(self.running.items()):
             if not th.is_alive():
                 self.finished(agent)
@@ -1065,6 +1235,12 @@ class Lead:
             if t["status"] == "in_qa" and (t.get("qa_by") or "").startswith("pass:") and not any(
                     r[2] == t["key"] for r in self.running.values()):
                 self.merge(t)
+        tasks = self.tasks()
+        # 2a. setup tasks the planner marked "qa": "none": the lead runs verify itself instead of a QA agent
+        no_qa = set(self.b.meta().get("no_qa") or [])
+        for t in tasks:
+            if t["status"] == "in_qa" and not t.get("qa_by") and t["key"] in no_qa:
+                self.lead_check(t)
         tasks = self.tasks()
         # 2. QA picks up hand-offs
         for t in tasks:
