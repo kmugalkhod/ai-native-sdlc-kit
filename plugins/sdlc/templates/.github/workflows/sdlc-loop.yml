@@ -1,3 +1,7 @@
+# Auth — set ONE of these repo secrets:
+#   CLAUDE_CODE_OAUTH_TOKEN  Claude subscription (Pro/Max/Team/Enterprise): run `claude setup-token` locally, paste the token
+#   ANTHROPIC_API_KEY        Claude Console API key
+#   Bedrock                  uncomment the aws-actions block + CLAUDE_CODE_USE_BEDROCK
 # Artifact-triggered loop: an accepted intent.md merged to main fires spec -> plan headlessly,
 # with the gatekeeper between stages, and opens a PR for human review. Build can be fired the same way.
 name: SDLC loop
@@ -35,8 +39,10 @@ jobs:
       - name: Run loop
         env:
           ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+          CLAUDE_CODE_OAUTH_TOKEN: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
           GH_TOKEN: ${{ github.token }}
         run: |
+          [ -n "$ANTHROPIC_API_KEY" ] || unset ANTHROPIC_API_KEY; [ -n "$CLAUDE_CODE_OAUTH_TOKEN" ] || unset CLAUDE_CODE_OAUTH_TOKEN
           git config user.name "sdlc-loop[bot]"; git config user.email "sdlc-loop@users.noreply.github.com"
           if [ -n "${{ inputs.change }}" ]; then
             python .sdlc/bin/pipeline.py "${{ inputs.change }}" --from "${{ inputs.from }}" --to "${{ inputs.to }}" --pr

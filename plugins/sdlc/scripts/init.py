@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Scaffold the AI-Native SDLC into a repo (called by /sdlc:init). Never overwrites existing files.
 
-  python init.py --root . [--ci github|gitlab|none] [--build CMD] [--test CMD] [--lint CMD]
+  python init.py --root . [--ci github|gitlab|none] [--setup CMD] [--build CMD] [--test CMD] [--lint CMD]
                  [--format CMD] [--protected GLOB ...] [--tracker jira|gitlab|github|none] [--upgrade-bin]
 
 Once .sdlc/config.json exists only a human (interactive terminal) can regenerate it with --force-config,
@@ -18,7 +18,8 @@ from pathlib import Path
 
 PLUGIN = Path(__file__).resolve().parent.parent
 TEMPLATES = PLUGIN / "templates"
-BIN_FILES = ["sdlc_core.py", "sdlc.py", "pipeline.py", "evals.py", "monitor.py"]
+BIN_FILES = ["sdlc_core.py", "sdlc.py", "pipeline.py", "evals.py", "monitor.py", "loop.py",
+             "board.py", "team.py", "trackers.py", "board_server.py"]
 CI_FILES = {
     "github": [".github/workflows/agent-evals.yml", ".github/workflows/claude-review.yml",
                ".github/workflows/sdlc-loop.yml", ".github/workflows/sdlc-monitor.yml"],
@@ -48,12 +49,16 @@ def main() -> None:
     ap = argparse.ArgumentParser()
     ap.add_argument("--root", default=".")
     ap.add_argument("--ci", choices=list(CI_FILES), default="none")
+    ap.add_argument("--setup", default="", help="installs dependencies, e.g. pip install -r requirements.txt / npm ci")
     ap.add_argument("--build", default="")
     ap.add_argument("--test", default="")
     ap.add_argument("--lint", default="")
     ap.add_argument("--format", default="", help="formatter run after each edit; {file} = edited path")
     ap.add_argument("--protected", nargs="*", default=[])
-    ap.add_argument("--tracker", default="none")
+    ap.add_argument("--tracker", default="internal", choices=["internal", "jira", "linear"])
+    ap.add_argument("--qa-start", default="", help="command that starts the app for QA, with {port}")
+    ap.add_argument("--developers", type=int, default=2)
+    ap.add_argument("--qa-agents", type=int, default=1)
     ap.add_argument("--vcs", default="auto")
     ap.add_argument("--upgrade-bin", action="store_true")
     ap.add_argument("--force-config", action="store_true")
@@ -68,10 +73,12 @@ def main() -> None:
             sys.exit("--force-config rewrites the agent's own gates; run it yourself in a terminal.")
     if not cfg_path.exists() or a.force_config:
         cfg = json.loads((TEMPLATES / ".sdlc" / "config.json").read_text(encoding="utf-8"))
-        cfg["verify"] = {"build": a.build, "test": a.test, "lint": a.lint}
+        cfg["verify"] = {"setup": a.setup, "build": a.build, "test": a.test, "lint": a.lint}
         cfg["format_cmd"] = a.format
         cfg["protected_paths"] = sorted(set(cfg.get("protected_paths", []) + a.protected))
         cfg["tracker"]["type"] = a.tracker
+        cfg["team"]["qa"]["start_cmd"] = a.qa_start
+        cfg["team"]["developers"], cfg["team"]["qa_agents"] = a.developers, a.qa_agents
         cfg["vcs"] = a.vcs if a.vcs != "auto" else {"github": "github", "gitlab": "gitlab"}.get(a.ci, "auto")
         cfg_path.parent.mkdir(parents=True, exist_ok=True)
         cfg_path.write_text(json.dumps(cfg, indent=2) + "\n", encoding="utf-8")
@@ -90,6 +97,15 @@ def main() -> None:
             skipped.append(f".sdlc/bin/{f}"); continue
         shutil.copy2(PLUGIN / "scripts" / f, dst)
         created.append(f".sdlc/bin/{f}")
+
+    # keep installed dependencies out of commits (the headless loop commits with `git add -A`)
+    gi = root / ".gitignore"
+    have = gi.read_text(encoding="utf-8").splitlines() if gi.exists() else []
+    missing = [x for x in (".venv/", "venv/", "node_modules/", "__pycache__/", ".pytest_cache/") if x not in have]
+    if missing:
+        with open(gi, "a", encoding="utf-8") as f:
+            f.write(("\n" if have and have[-1] else "") + "# added by sdlc init\n" + "\n".join(missing) + "\n")
+        created.append(".gitignore (+" + ", ".join(missing) + ")")
 
     print(json.dumps({"created": created, "skipped_existing": skipped}, indent=2))
 

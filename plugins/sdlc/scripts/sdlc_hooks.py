@@ -145,6 +145,12 @@ def pre_bash(root: Path, cfg: dict, payload: dict) -> None:
                         block(root, f"Fix mode is on: shell writes to test files are blocked ({tok} matches '{hit}').",
                               command=cmd)
 
+    # 2b. Human-only board actions: an agent session (SDLC_AGENT set by the team lead) cannot approve a design,
+    #     even by clearing the variable inline.
+    if os.environ.get("SDLC_AGENT") and re.search(r"board\.py\s+(design-(approve|changes)|resume)\b", cmd):
+        block(root, "Only the human approves a design or resumes an escalated task. Ask them on the board instead.",
+              command=cmd)
+
     # 3. No direct push to protected branches: everything the agent writes arrives as a PR.
     protected = set(cfg.get("protected_branches", []))
     for seg in segs:

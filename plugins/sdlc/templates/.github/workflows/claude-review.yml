@@ -1,3 +1,7 @@
+# Auth — set ONE of these repo secrets:
+#   CLAUDE_CODE_OAUTH_TOKEN  Claude subscription (Pro/Max/Team/Enterprise): run `claude setup-token` locally, paste the token
+#   ANTHROPIC_API_KEY        Claude Console API key
+#   Bedrock                  uncomment the aws-actions block + CLAUDE_CODE_USE_BEDROCK
 # AI in the PR review loop: every PR gets the same REVIEW.md passes; @claude on a comment fixes and pushes.
 # Findings never approve or block on their own: branch protection still requires a code owner.
 name: Claude review
@@ -25,6 +29,7 @@ jobs:
       - uses: anthropics/claude-code-action@v1
         with:
           anthropic_api_key: ${{ secrets.ANTHROPIC_API_KEY }}
+          claude_code_oauth_token: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
           # use_bedrock: 'true'   # with aws-actions/configure-aws-credentials before this step
           prompt: |
             Review PR #${{ github.event.pull_request.number }} following REVIEW.md exactly.
@@ -48,6 +53,7 @@ jobs:
       - uses: anthropics/claude-code-action@v1
         with:
           anthropic_api_key: ${{ secrets.ANTHROPIC_API_KEY }}
+          claude_code_oauth_token: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
           claude_args: >-
             --model sonnet
             --append-system-prompt "Follow CLAUDE.md. Fix code, never weaken tests. If the fix departs from the change's plan.md, update plan.md in the same commit."

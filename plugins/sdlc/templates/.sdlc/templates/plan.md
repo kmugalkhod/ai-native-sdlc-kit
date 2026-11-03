@@ -8,6 +8,10 @@ From: spec.md ({spec_commit}) · Status: draft · Accepted by: —
 ## Files that change
 <!-- path — new|modified — why -->
 
+## Dependencies
+<!-- New packages: name, version constraint, why, and the manifest they go in (requirements.txt, pyproject.toml,
+     package.json...). Installed by the `setup` verify step, never ad hoc. "None" if none. -->
+
 ## Order of work
 1.
 

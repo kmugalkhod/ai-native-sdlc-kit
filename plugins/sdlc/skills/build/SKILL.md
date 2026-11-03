@@ -17,10 +17,11 @@ If on a protected branch (see `.sdlc/config.json`), create `sdlc/<change-folder>
 
 ## Implement
 1. Follow plan.md's **Order of work** step by step. After each step run the narrowest relevant check, then move on.
-2. Tests named in **Tests that prove it** are written with the code (bug fixes: test first — use `/sdlc:bugfix` instead).
-3. The feedback loop is the definition of done: `python3 .sdlc/bin/sdlc.py verify` must be fully green (build, test, lint). If it fails, fix the **code**, never the test, never skip/delete a failing test. Iterate.
-4. UI work: if a browser/screenshot tool is available, compare against the mock in spec.md; 2–3 rounds is normal.
-5. Hooks will block protected paths, governance files, secrets and production actions. A block is a boundary, not an obstacle: change approach or tell the user what approval is needed. Never try to work around a hook.
+2. Dependencies: add each package from plan.md **Dependencies** to the manifest (requirements.txt / pyproject.toml / package.json) with a version constraint, then run `python3 .sdlc/bin/sdlc.py verify setup` — the configured setup command installs it. Do not run pip/npm install ad hoc; if a package is not in the plan, add it to plan.md Deviations first. If verify has no setup command, tell the user to set `verify.setup` in `.sdlc/config.json`.
+3. Tests named in **Tests that prove it** are written with the code (bug fixes: test first — use `/sdlc:bugfix` instead).
+4. The feedback loop is the definition of done: `python3 .sdlc/bin/sdlc.py verify` must be fully green (setup, build, test, lint). If it fails, fix the **code**, never the test, never skip/delete a failing test. Iterate.
+5. UI work: if `<change>/design/mockup.html` exists it is the approved design — match it and DESIGN.md exactly (layout, tokens, copy, states). If a browser/screenshot tool is available, compare your page against the mockup at 1280px and 390px; 2–3 rounds is normal.
+6. Hooks will block protected paths, governance files, secrets and production actions. A block is a boundary, not an obstacle: change approach or tell the user what approval is needed. Never try to work around a hook.
 
 ## Keep plan.md honest
 Whenever the implementation departs from the plan (different file, extra step, changed approach), update plan.md in the **same commit**: fix the affected section and append a line under **Deviations** (`date — what — why`). At the end set `Status: implemented`.

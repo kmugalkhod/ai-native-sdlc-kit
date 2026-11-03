@@ -23,7 +23,7 @@ DEFAULTS: dict = {
         "**/test_*.py", "**/*_test.py", "**/*_test.go",
         "**/*.test.*", "**/*.spec.*", "**/src/test/**", "**/itest/**",
     ],
-    "verify": {"build": "", "test": "", "lint": ""},
+    "verify": {"setup": "", "build": "", "test": "", "lint": ""},
     "format_cmd": "",
     "lint_on_edit_cmd": "",
     "prod_gate": {
@@ -34,14 +34,32 @@ DEFAULTS: dict = {
     "protected_branches": ["main", "master"],
     "secret_scan": True,
     "secret_scan_exclude": [],
-    "tracker": {"type": "none", "url_template": ""},
+    "tracker": {"type": "internal", "url_template": "",
+                "jira": {"base_url": "", "project_key": ""}, "linear": {"team_key": ""}},
     "vcs": "auto",
     "models": {
         "spec": "sonnet", "plan": "sonnet", "build": "sonnet",
         "review": "sonnet", "gate": "sonnet", "triage": "sonnet", "evals": "sonnet",
     },
-    "pipeline": {"commit": True, "branch_prefix": "sdlc/", "open_pr": False, "max_fix_rounds": 3},
+    "pipeline": {"commit": True, "branch_prefix": "sdlc/", "open_pr": False, "max_fix_rounds": 3,
+                 "allowed_bash": []},
     "evals": {"dir": "evals/cases", "threshold": 0.9},
+    "team": {
+        "developers": 2, "qa_agents": 1,
+        "models": {"planner": "sonnet", "developer": "sonnet", "qa": "sonnet", "helper": "sonnet",
+                   "designer": "sonnet"},
+        "max_qa_rounds": 3, "max_dev_attempts": 2, "max_help_rounds": 2, "run_timeout_minutes": 40,
+        "branch_prefix": "team/", "worktree_dir": ".sdlc/worktrees",
+        "allowed_bash": [],
+        "qa": {"start_cmd": "", "health_path": "/", "port_base": 8600, "start_timeout": 60,
+               "browser": "playwright-mcp", "browser_executable": "", "browser_args": []},
+        "design": {"mode": "auto", "approval": "human", "max_rounds": 3, "approval_timeout_minutes": 240,
+                   "plugin_dirs": [], "design_port": 8690,
+                   "ui_globs": ["**/*.html", "**/*.css", "**/*.scss", "**/*.jsx", "**/*.tsx", "**/*.vue",
+                                "**/*.svelte", "**/static/**", "**/templates/**", "**/components/**",
+                                "**/pages/**", "**/app/**/page.*", "**/ui/**"]},
+        "poll_seconds": 3, "sync_seconds": 10, "board_port": 8765,
+    },
 }
 
 

@@ -61,7 +61,7 @@ def claude(prompt: str, model: str, tools: list[str], root: Path, agent: str | N
         raise Escalate(f"claude run failed: {str(data.get('result'))[-1500:]}")
     cost = data.get("total_cost_usd")
     if cost is not None:
-        print(f"    cost ${cost:.3f}", flush=True)
+        print(f"    cost (est.) ${cost:.3f}", flush=True)
     return data.get("result") or ""
 
 
@@ -118,7 +118,8 @@ def run(root: Path, cfg: dict, change: Path, a) -> None:
     rel = change.relative_to(root).as_posix()
     if (header_field(change / "intent.md", "Status") or "") not in ("accepted", "approved"):
         raise Escalate("intent.md is not Status: accepted — the product owner accepts intent before the loop runs")
-    tools_build = WRITE + SAFE_BASH + [f"Bash({c})" for c in cfg["verify"].values() if c]
+    tools_build = (WRITE + SAFE_BASH + [f"Bash({c})" for c in cfg["verify"].values() if c]
+                   + [f"Bash({c})" for c in cfg["pipeline"].get("allowed_bash", [])])
     bounds = STAGES[STAGES.index(a.from_stage): STAGES.index(a.to_stage) + 1]
 
     for stage in bounds:

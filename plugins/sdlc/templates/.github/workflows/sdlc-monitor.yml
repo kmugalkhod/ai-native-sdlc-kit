@@ -1,3 +1,7 @@
+# Auth — set ONE of these repo secrets:
+#   CLAUDE_CODE_OAUTH_TOKEN  Claude subscription (Pro/Max/Team/Enterprise): run `claude setup-token` locally, paste the token
+#   ANTHROPIC_API_KEY        Claude Console API key
+#   Bedrock                  uncomment the aws-actions block + CLAUDE_CODE_USE_BEDROCK
 # Closing the loop: deterministic control bands; Claude is invoked only on a breach, with tier-scoped tools.
 name: SDLC monitor
 on:
@@ -28,8 +32,10 @@ jobs:
       - name: Check bands
         env:
           ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+          CLAUDE_CODE_OAUTH_TOKEN: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
           GH_TOKEN: ${{ github.token }}
         run: |
+          [ -n "$ANTHROPIC_API_KEY" ] || unset ANTHROPIC_API_KEY; [ -n "$CLAUDE_CODE_OAUTH_TOKEN" ] || unset CLAUDE_CODE_OAUTH_TOKEN
           git config user.name "sdlc-monitor[bot]"; git config user.email "sdlc-monitor@users.noreply.github.com"
           python .sdlc/bin/monitor.py
       # Note: .sdlc/state/monitor.json (cooldowns) is not persisted between runs here; use actions/cache

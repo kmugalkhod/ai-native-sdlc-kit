@@ -3,6 +3,7 @@
 #       python .sdlc/bin/monitor.py --dry-run  (see what would fire)
 metrics:
   - metric: ci_test_failure_rate
+    enabled: false                     # sample data — point source at a real metric, then set true
     owner: "@platform-team"
     # source: {csv: path, column: name}  or  {cmd: "script printing a JSON list or one number per line"}
     source: { csv: sdlc/monitor/sample_series.csv, column: value }

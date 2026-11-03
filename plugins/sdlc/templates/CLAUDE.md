@@ -3,12 +3,14 @@
 <!-- Keep this under a page. When Claude makes the same mistake twice, the correction goes here. -->
 
 ## Commands
+- Setup (install deps): `{setup}`
 - Build: `{build}`
 - Test: `{test}`
 - Lint: `{lint}`
 
 ## Verifying your work
-- Run build, test and lint (`python .sdlc/bin/sdlc.py verify`) before reporting any task complete, and paste the output.
+- Run `python .sdlc/bin/sdlc.py verify` (setup → build → test → lint) before reporting any task complete, and paste the output.
+- New dependency: add it to the manifest (requirements.txt / pyproject.toml / package.json) with a version constraint, then run verify — the setup step installs it. Never pip/npm install ad hoc.
 - If a test fails, fix the code, not the test. Never skip, delete or loosen a failing test.
 - For bug fixes: reproduce the bug as a failing test first (`/sdlc:bugfix`).
 

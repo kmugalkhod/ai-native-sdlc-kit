@@ -139,6 +139,9 @@ def main() -> None:
     for m in metrics:
         if a.metric and m["metric"] != a.metric:
             continue
+        if m.get("enabled", True) is False and not a.metric:
+            print(f"{m['metric']}: disabled (enabled: false)")
+            continue
         series = read_series(root, m["source"])
         tier, fired, stats = western_electric(series, int(m.get("baseline", {}).get("window", 30)),
                                               m.get("direction", "both"))

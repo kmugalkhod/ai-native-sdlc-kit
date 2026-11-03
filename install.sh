@@ -63,8 +63,8 @@ cat <<'EOF'
 
 Next:
   1. Sign in once:      claude auth login      (Claude Pro/Max/Team)  — or set ANTHROPIC_API_KEY / Bedrock vars
-  2. In your app repo:  cd <your-repo> && claude
-  3. Inside Claude:     /sdlc:init            (then /sdlc:intent <idea> to start the loop)
+  2. Open your app:     mkdir my-app && cd my-app && claude
+  3. Inside Claude:     /sdlc:loop <your idea>
 
 Uninstall:  claude plugin uninstall sdlc@ai-native-sdlc && claude plugin marketplace remove ai-native-sdlc
 EOF

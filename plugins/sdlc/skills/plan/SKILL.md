@@ -18,6 +18,7 @@ spec.md exists with `Status: accepted` and no `- [ ]` flagged concerns. Otherwis
 1. Read intent.md, spec.md, CLAUDE.md, and every file the change will touch plus its tests and callers. Use `sdlc:researcher` for broad sweeps.
 2. Draft the plan from `.sdlc/templates/plan.md`:
    - **Files that change** — path, new/modified, why.
+   - **Dependencies** — every new package with a version constraint and the manifest it goes in; `None` if none. Prefer the standard library and packages already in use.
    - **Order of work** — small steps, each leaving the build green.
    - **Tests that prove it** — test files and cases mapped to the spec's acceptance criteria; for bug fixes the failing test comes first.
    - **Risks** — what it could break, the riskiest step, mitigation (rate limits, migrations, auth, data).

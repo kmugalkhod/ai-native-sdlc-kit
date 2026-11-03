@@ -13,7 +13,7 @@ The installer checks prerequisites, copies the kit to `~/.ai-native-sdlc`, adds 
 After it finishes, tell the user to:
 1. Restart Claude Code so the `/sdlc:*` commands appear.
 2. Sign in with `claude auth login` (Claude subscription), or set `ANTHROPIC_API_KEY` / the Bedrock variables.
-3. Open their app repo and run `/sdlc:init`, then `/sdlc:intent <idea>`.
+3. Open their app folder in Claude Code and run `/sdlc:loop <idea>`.
 
 If `claude` is not on PATH, the installer stops and says so. Ask the user to install Claude Code first rather than working around it.
 

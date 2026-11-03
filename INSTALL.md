@@ -21,7 +21,7 @@ Re-running it updates the plugin.
 claude auth login          # Claude subscription (or set ANTHROPIC_API_KEY / Bedrock vars)
 cd <your-app-repo> && claude
 ```
-Inside Claude, run `/sdlc:init`, then `/sdlc:intent <your idea>`. The full loop is described in README.md.
+Inside Claude, run `/sdlc:loop <your idea>`. That one command does the whole loop and asks you at each gate.
 
 ## Uninstall
 ```bash

@@ -4,7 +4,7 @@
   python .sdlc/bin/sdlc.py new <slug> [--title "..."]      start a change folder with intent.md
   python .sdlc/bin/sdlc.py status [--json]                  where every change sits in the loop
   python .sdlc/bin/sdlc.py metrics [--json]                 playbook leading/lagging indicators from git
-  python .sdlc/bin/sdlc.py verify [build|test|lint ...]     run the feedback-loop commands, show output
+  python .sdlc/bin/sdlc.py verify [setup|build|test|lint ...] install deps, then build/test/lint; show output
   python .sdlc/bin/sdlc.py fix-mode on|off|status [--change X] [--lock FILE ...]
   python .sdlc/bin/sdlc.py approve-release <ticket> [--approver NAME]   (human terminal only)
   python .sdlc/bin/sdlc.py revoke-release

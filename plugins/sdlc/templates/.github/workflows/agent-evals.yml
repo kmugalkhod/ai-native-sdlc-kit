@@ -1,5 +1,8 @@
+# Auth — set ONE of these repo secrets:
+#   CLAUDE_CODE_OAUTH_TOKEN  Claude subscription (Pro/Max/Team/Enterprise): run `claude setup-token` locally, paste the token
+#   ANTHROPIC_API_KEY        Claude Console API key
+#   Bedrock                  uncomment the aws-actions block + CLAUDE_CODE_USE_BEDROCK
 # Continuous evals: regression-test the agent's configuration like code.
-# Required: secret ANTHROPIC_API_KEY  (or Bedrock: set vars.AWS_ROLE_ARN + vars.AWS_REGION, see comments)
 # Required: repo variable SDLC_MARKETPLACE = <owner>/<repo of the ai-native-sdlc kit>
 name: Agent evals
 on:
@@ -35,8 +38,10 @@ jobs:
       - name: Run eval suite
         env:
           ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+          CLAUDE_CODE_OAUTH_TOKEN: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
           # CLAUDE_CODE_USE_BEDROCK: '1'
         run: |
+          [ -n "$ANTHROPIC_API_KEY" ] || unset ANTHROPIC_API_KEY; [ -n "$CLAUDE_CODE_OAUTH_TOKEN" ] || unset CLAUDE_CODE_OAUTH_TOKEN
           git config user.name "sdlc-evals"; git config user.email "evals@users.noreply.github.com"
           python .sdlc/bin/evals.py --json eval-results.json
       - uses: actions/upload-artifact@v4

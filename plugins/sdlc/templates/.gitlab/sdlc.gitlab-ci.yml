@@ -6,6 +6,7 @@
 #   SDLC_MARKETPLACE   git URL of the ai-native-sdlc kit repo (e.g. https://gitlab.example.com/tools/ai-native-sdlc.git)
 #   GITLAB_TOKEN       project access token (api, write_repository) for MR notes / pushes
 #   Model access, one of:
+#     CLAUDE_CODE_OAUTH_TOKEN (masked) — Claude subscription token from `claude setup-token`
 #     ANTHROPIC_API_KEY (masked)
 #     Bedrock: CLAUDE_CODE_USE_BEDROCK=1, AWS_REGION, and AWS creds (OIDC/role on the runner)
 # Schedules: create a pipeline schedule with SDLC_JOB=monitor (hourly) and one with SDLC_JOB=evals (nightly).
@@ -15,6 +16,7 @@
   before_script:
     - apt-get update -qq && apt-get install -y -qq python3 python3-yaml git curl >/dev/null
     - npm install -g @anthropic-ai/claude-code >/dev/null
+    - '[ -n "$ANTHROPIC_API_KEY" ] || unset ANTHROPIC_API_KEY; [ -n "$CLAUDE_CODE_OAUTH_TOKEN" ] || unset CLAUDE_CODE_OAUTH_TOKEN'
     - claude plugin marketplace add "$SDLC_MARKETPLACE"
     - claude plugin install sdlc@ai-native-sdlc
     - git config user.name "sdlc-bot"; git config user.email "sdlc-bot@noreply.local"
