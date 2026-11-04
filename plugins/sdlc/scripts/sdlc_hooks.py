@@ -206,6 +206,44 @@ def post_edit(root: Path, cfg: dict, payload: dict) -> None:
             sys.exit(2)
 
 
+# ---------------------------------------------------------------- activity (agent teams)
+WT_RE = re.compile(r"\.sdlc[/\\]worktrees[/\\]([A-Za-z0-9_-]+)")
+AS_RE = re.compile(r"--as\s+([A-Za-z0-9_-]+)")
+
+
+def activity(root: Path, cfg: dict, payload: dict) -> None:
+    """Show what each agent-team teammate is doing on the live board. Silent and best-effort: never blocks."""
+    ti = payload.get("tool_input") or {}
+    tool = payload.get("tool_name") or ""
+    where = " ".join(str(x) for x in (ti.get("file_path"), ti.get("command"), ti.get("url"), payload.get("cwd")) if x)
+    m = AS_RE.search(ti.get("command") or "") or WT_RE.search(where)
+    if not m or m.group(1) in ("integration", "check"):
+        return
+    agent = m.group(1)
+    if tool == "Bash":
+        cmd = re.sub(r'^\s*cd\s+("[^"]*"|\S+)\s*&&\s*', "", " ".join((ti.get("command") or "").split()))
+        what = "$ " + cmd[:110]
+    elif tool in ("Edit", "Write", "MultiEdit"):
+        what = f"{tool.lower()} " + re.split(r"worktrees[/\\][^/\\]+[/\\]", ti.get("file_path", ""))[-1]
+    elif tool.startswith("mcp__playwright__"):
+        what = f"browser: {tool.split('__')[-1].replace('browser_', '')} {str(ti.get('url') or ti.get('element') or '')[:60]}"
+    else:
+        return
+    if "board.py" in what:
+        return
+    try:
+        sys.path.insert(0, str(Path(__file__).resolve().parent))
+        from board import Board  # noqa: E402
+        b = Board(root / ".sdlc" / "state" / "board.db")
+        a = next((x for x in b.agents() if x["name"] == agent), None)
+        if not a:
+            return
+        b.upsert_agent(agent, activity=what.strip())
+        b.event(a.get("item_key"), agent, "activity", what.strip())
+    except Exception:
+        pass
+
+
 def main() -> None:
     mode = sys.argv[1] if len(sys.argv) > 1 else ""
     try:
@@ -216,7 +254,8 @@ def main() -> None:
     if not root:
         sys.exit(0)  # repo not initialised for the SDLC kit
     cfg = load_config(root)
-    {"pre-edit": pre_edit, "pre-bash": pre_bash, "post-edit": post_edit}.get(mode, lambda *a: None)(root, cfg, payload)
+    {"pre-edit": pre_edit, "pre-bash": pre_bash, "post-edit": post_edit, "activity": activity}.get(
+        mode, lambda *a: None)(root, cfg, payload)
     sys.exit(0)
 
 

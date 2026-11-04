@@ -11,6 +11,10 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
+import re
+import subprocess
+import time
 import sys
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
@@ -88,6 +92,14 @@ h1{margin:0;font-size:15px;font-weight:700;letter-spacing:-.01em;white-space:now
 
 /* ---------- banner ---------- */
 #banner:empty{display:none}
+.now{flex:none;display:flex;align-items:center;gap:10px;margin:10px 18px 0;padding:9px 14px;border-radius:10px;
+  background:var(--panel);border:1px solid var(--line);font-size:13px;min-height:40px;overflow:hidden}
+.now:empty{display:none}
+.now .lbl{font-size:10.5px;font-weight:800;letter-spacing:.08em;color:var(--faint);text-transform:uppercase;flex:none}
+.now .msg{white-space:nowrap;overflow:hidden;text-overflow:ellipsis;min-width:0}
+.now .t{color:var(--faint);font-size:11.5px;flex:none;margin-left:auto}
+.now.flash{animation:nowflash 1.2s ease-out}
+@keyframes nowflash{0%{border-color:var(--green);box-shadow:0 0 0 3px color-mix(in srgb,var(--green) 25%,transparent)}100%{}}
 .banner{flex:none;margin:12px 18px 0;padding:12px 14px;border-radius:var(--r);display:flex;gap:14px;align-items:center;
   border:1px solid color-mix(in srgb,var(--pink) 40%,var(--line));background:linear-gradient(90deg,color-mix(in srgb,var(--pink) 12%,var(--panel)),var(--panel))}
 .banner .ic{width:36px;height:36px;border-radius:10px;display:grid;place-items:center;background:color-mix(in srgb,var(--pink) 20%,transparent);font-size:18px;flex:none}
@@ -156,8 +168,12 @@ select{background:var(--panel2);border:1px solid var(--line);border-radius:9px;h
 .card .top .grow{min-width:0} .card .top .mono{white-space:nowrap}
 .card .ttl{margin:5px 0 9px;font-weight:600;line-height:1.35;color:var(--text)}
 .card .foot{display:flex;align-items:center;gap:5px;flex-wrap:wrap}
-.livebar{margin-top:8px;padding-top:7px;border-top:1px dashed var(--line);font-size:11.5px;color:var(--green);white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+.livebar.wait{color:var(--muted)}
+.livebar{margin-top:8px;padding-top:7px;border-top:1px dashed var(--line);font-size:11.5px;color:var(--green);display:-webkit-box;-webkit-line-clamp:2;-webkit-box-orient:vertical;overflow:hidden;word-break:break-word}
 .livebar.pink{color:var(--pink)}
+.prog-card{margin-top:8px}.prog-card .bar{height:5px}
+.prog-meta{display:flex;gap:8px;font-size:11px;color:var(--muted);margin-top:5px;font-variant-numeric:tabular-nums}
+.prog-meta .ok{color:var(--green)}
 .tag{font-size:11px;height:20px;display:inline-flex;align-items:center;padding:0 7px;border-radius:6px;white-space:nowrap;max-width:140px;overflow:hidden;text-overflow:ellipsis;
   background:color-mix(in srgb,var(--sc) 14%,transparent);color:var(--sc);border:1px solid color-mix(in srgb,var(--sc) 30%,transparent)}
 .chip{font-size:11px;height:20px;display:inline-flex;align-items:center;gap:3px;padding:0 6px;border-radius:6px;color:var(--muted);border:1px solid var(--line);white-space:nowrap}
@@ -264,6 +280,7 @@ pre.desc{white-space:pre-wrap;margin:0;font:inherit;color:var(--muted)}
     <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" aria-hidden="true"><path d="M21 12.8A9 9 0 1 1 11.2 3a7 7 0 0 0 9.8 9.8z"/></svg></button>
 </header>
 <div id="banner"></div>
+<div id="now" class="now" aria-live="polite"></div>
 <div class="shell">
   <aside class="pane side" aria-label="Epics and stories">
     <div class="ph">Epics &amp; stories <span class="n" id="sidecount"></span></div>
@@ -306,7 +323,7 @@ const COLS=[["todo","To Do","var(--muted)"],["in_progress","In Progress","var(--
 const LABEL=Object.assign(Object.fromEntries(COLS.map(c=>[c[0],c[1]])),{in_qa:"In QA",review:"Needs approval"});
 const COLOF=st=>st==="review"?"in_qa":st;
 const STORY_COLORS=["var(--violet)","var(--teal)","var(--amber)","var(--blue)","var(--pink)","var(--green)","var(--red)"];
-let S={items:[],agents:[],events:[],messages:[],meta:{}},since=0,view="board",openKey=null,fstory="",lastSig="";
+let S={items:[],agents:[],events:[],messages:[],meta:{},progress:{},live:{},now:0},since=0,view="board",openKey=null,fstory="",lastSig="";
 const closedEpics=new Set(),closedGroups=new Set();
 const $=id=>document.getElementById(id);
 const esc=s=>String(s??"").replace(/[&<>"']/g,c=>({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;","'":"&#39;"}[c]));
@@ -324,7 +341,30 @@ function work(){const q=$("q").value.trim().toLowerCase(),fw=$("fwho").value;
   return S.items.filter(i=>(i.type==="task"||i.type==="design")&&match(i,q)
     &&(!fstory||(fstory==="design"?i.type==="design":i.parent_key===fstory))
     &&(!fw||i.assignee===fw||(i.qa_by||"").endsWith(fw)))}
-function liveOn(key){return S.agents.find(a=>a.item_key===key&&["working","helping","designing"].includes(a.status))}
+const BUSY=["working","helping","designing"];
+function curKey(a){const j=((S.meta.tl||{}).jobs||{})[a.name];if(!j||!(j.keys||[]).length)return a.item_key;
+  if(j.kind!=="developer")return j.keys[0];
+  return j.keys.find(k=>(S.items.find(i=>i.key===k)||{}).status==="in_progress")||j.keys[j.keys.length-1]}
+function liveOn(t){const key=t.key,jobs=(S.meta.tl||{}).jobs;
+  if(jobs){for(const [name,j] of Object.entries(jobs)){if(!(j.keys||[]).includes(key))continue;
+      const a=S.agents.find(x=>x.name===name)||{name,status:"working",activity:""};
+      if(j.kind==="developer"){if(t.status!=="in_progress")continue;  // handed in: the developer is on its next task
+        const cur=j.keys.find(k=>(S.items.find(i=>i.key===k)||{}).status==="in_progress");if(cur===key)return a}
+      else return a}
+    return null}
+  return S.agents.find(a=>a.item_key===key&&BUSY.includes(a.status)&&!(t.status==="in_qa"&&roleOf(a.name)==="developer"))}
+const dur=sec=>sec==null?"":sec<60?`${Math.floor(sec)}s`:sec<3600?`${Math.floor(sec/60)}m`:`${Math.floor(sec/3600)}h ${Math.floor(sec%3600/60)}m`;
+function jobOf(name){return ((S.meta.tl||{}).jobs||{})[name]}
+function lastSaid(name){const e=[...S.events].reverse().find(x=>x.actor===name&&(x.kind==="comment"||x.kind==="message"));
+  return e?{text:e.text.slice(0,120),age:S.now-Date.parse(e.ts)/1000}:null}
+function liveText(a,key){let c;const j=jobOf(a.name);const p=key?(S.progress||{})[key]:null;const bits=[];
+  const lv=(S.live||{})[a.name];const lvAge=lv?S.now-Date.parse(lv.ts)/1000:null;
+  if(lv&&lvAge<900)bits.push(`${lv.text} (${dur(lvAge)} ago)`);
+  else if((c=lastSaid(a.name))&&c.age<900)bits.push(`💬 ${c.text} (${dur(c.age)} ago)`);
+  else if(p&&p.last_file)bits.push(`editing ${p.last_file.split("/").slice(-2).join("/")} (${dur(S.now-p.last_change)} ago)`);
+  else if(a.activity&&!/^assigned:/.test(a.activity))bits.push(a.activity);
+  if(j&&j.started)bits.push(`${dur(S.now-j.started)} on it`);
+  return bits.join(" · ")||a.activity||a.status}
 function keepScroll(fn){const ids=["nav","list","team","feed"];const pos={};
   ids.forEach(id=>{const e=$(id);if(e)pos[id]=e.scrollTop});
   const cols={};document.querySelectorAll(".cards[data-col]").forEach(c=>cols[c.dataset.col]=c.scrollTop);
@@ -382,7 +422,7 @@ function renderCrumb(){if(!fstory){$("crumb").innerHTML=`All work <span class="s
   $("crumb").innerHTML=`<span class="tag" style="--sc:${fstory==="design"?"var(--pink)":storyColor(fstory)}">${esc(s.key)}</span> ${esc(s.title||"")} <span class="sub">· ${(n=>n+(n===1?" item":" items"))(work().length)}</span> <button class="clear" data-story="">Clear</button>`}
 
 /* board */
-function card(t){const live=liveOn(t.key);
+function card(t){const live=liveOn(t);
   if(t.type==="design"){const dm=(S.meta.design||{});
     return `<div class="card design${live?" live":""}" data-key="${esc(t.key)}" tabindex="0" role="button" aria-label="${esc(t.key+" "+t.title)}">
      <div class="top"><span class="mono">🎨 ${esc(t.key)}</span><span class="grow"></span><span class="chip pink">${esc(dm.mode||"design")}</span></div>
@@ -407,8 +447,18 @@ function card(t){const live=liveOn(t.key);
      ${escd?`<span class="chip red" title="escalated to you">⚑ needs you</span>`:""}
      ${waiting.length&&t.status==="todo"?`<span class="chip amber" title="waiting on">🔒 ${esc(waiting.join(", "))}</span>`:""}
    </div>
-   ${live?`<div class="livebar">● ${esc(live.name)} · ${esc(live.activity||"working")}</div>`:""}
+   ${progressBlock(t)}
+   ${live?`<div class="livebar">● ${esc(live.name)} · ${esc(liveText(live,t.key))}</div>`:
+     t.status==="in_qa"&&!(t.qa_by||"").startsWith("pass:")?`<div class="livebar wait">⏳ ${t.qa_by?"QA "+esc(t.qa_by.replace(/^fail:/,"")):"waiting for QA"}</div>`:
+     t.status==="in_qa"?`<div class="livebar wait">✓ passed QA · merges with the rest of its story</div>`:""}
   </div>`}
+function progressBlock(t){const p=(S.progress||{})[t.key];if(!p||t.status!=="in_progress")return"";
+  const tot=Math.max(p.files_total,1),pc=Math.round(100*Math.min(p.files_done,tot)/tot)*(p.committed?1:0.9);
+  const age=p.last_change?Math.max(0,S.now-p.last_change):null;
+  const ago=age===null?"no changes yet":age<60?`${Math.floor(age)}s ago`:age<3600?`${Math.floor(age/60)}m ago`:`${Math.floor(age/3600)}h ago`;
+  return `<div class="prog-card"><div class="bar"><i style="width:${p.committed?100:Math.max(4,pc)}%"></i></div>
+    <div class="prog-meta"><span>${p.files_total?`${p.files_done}/${p.files_total} files`:`${p.changed} files changed`}</span>
+    ${p.committed?`<span class="ok">✓ committed</span>`:""}<span class="grow"></span><span title="last change in the worktree">${esc(ago)}</span></div></div>`}
 function renderBoard(){const ts=work();
   $("board").innerHTML=COLS.map(([k,l,c])=>{const cs=ts.filter(t=>COLOF(t.status)===k);
     return `<section class="col" style="--c:${c}" aria-label="${l}"><div class="colh"><span class="sw"></span>${l}<span class="n">${cs.length}</span></div>
@@ -436,17 +486,26 @@ function renderList(){const ts=work();const groups=[];
 function renderTeam(){const ag=S.agents.filter(a=>a.role!=="planner"||a.status==="working");
   const busy=ag.filter(a=>["working","helping","designing"].includes(a.status)).length;
   $("teamcount").textContent=ag.length?`${busy} active · ${ag.length}`:"";
-  $("team").innerHTML=ag.map(a=>{const t=S.items.find(i=>i.key===a.item_key);
+  $("team").innerHTML=ag.map(a=>{const ck=curKey(a);const t=S.items.find(i=>i.key===ck);
     return `<div class="ag"><div class="av ${esc(a.role)}">${ini(a.name)}</div><div style="min-width:0;flex:1">
      <div class="nm">${esc(a.name)} <span class="dot ${esc(a.status)}" title="${esc(a.status)}"></span><span class="sub">${esc(a.role)}</span></div>
-     <div class="act" title="${esc(a.activity)}">${t?`<a href="#" data-key="${esc(t.key)}" class="mono">${esc(t.key)}</a> `:""}${esc(a.activity||a.status)}</div></div>
-     <div class="cost">${a.runs||0} runs<br>$${(a.cost||0).toFixed(2)}</div></div>`}).join("")||`<div class="empty">No agents yet</div>`;
+     <div class="act" title="${esc(a.activity)}">${["working","helping","designing"].includes(a.status)?
+        `${t?`<a href="#" data-key="${esc(t.key)}" class="mono">${esc(t.key)}</a> `:""}${esc(liveText(a,ck))}`:
+        `<span class="sub">idle</span>${a.activity?` · ${esc(a.activity)}`:""}`}</div></div>
+     <div class="cost">${a.runs||a.cost?`${a.runs||0} runs<br>$${(a.cost||0).toFixed(2)}`:""}</div></div>`}).join("")||`<div class="empty">No agents yet</div>`;
   const opts=["all","developer","qa",...S.agents.map(a=>a.name)];const cur=$("to").value;
   $("to").innerHTML=opts.map(o=>`<option value="${esc(o)}">@${esc(o)}</option>`).join("");$("to").value=opts.includes(cur)?cur:"all";
   const fw=$("fwho").value;$("fwho").innerHTML=`<option value="">Everyone</option>`+S.agents.filter(a=>a.role!=="planner").map(a=>`<option>${esc(a.name)}</option>`).join("");$("fwho").value=fw}
-function evClass(e){if(e.kind==="message")return"msg";if(e.kind==="qa")return e.text.startsWith("PASS")?"qa-pass":"qa-fail";if(e.kind==="merge")return"merge";return""}
+let lastNowId=0;
+function renderNow(){const want=["comment","qa","merge","message","help","assign","design"];
+  const e=[...S.events].reverse().find(x=>want.includes(x.kind)&&!(x.kind==="assign"&&/^task created|^assigned to/.test(x.text)));
+  if(!e){$("now").innerHTML="";return}
+  const icon={qa:e.text.startsWith("PASS")?"✅":"❌",merge:"🔀",comment:"💬",message:"✉️",help:"🤝",assign:"▶️",design:"🎨"}[e.kind]||"•";
+  $("now").innerHTML=`<span class="lbl">Now</span><span aria-hidden="true">${icon}</span><span class="msg"><b>${esc(e.actor)}</b>${e.item_key?` <a href="#" data-key="${esc(e.item_key)}" class="mono">${esc(e.item_key)}</a>`:""} · ${esc(e.text)}</span><span class="t">${ago(e.ts)} ago</span>`;
+  if(e.id!==lastNowId){if(lastNowId){$("now").classList.remove("flash");void $("now").offsetWidth;$("now").classList.add("flash")}lastNowId=e.id}}
+function evClass(e){if(e.kind==="message"||e.kind==="comment")return"msg";if(e.kind==="qa")return e.text.startsWith("PASS")?"qa-pass":"qa-fail";if(e.kind==="merge")return"merge";return""}
 function renderFeed(){const only=$("onlymsg").checked,q=$("q").value.trim().toLowerCase();
-  const evs=S.events.filter(e=>(!only||["message","qa","help"].includes(e.kind))&&(!q||(e.text+" "+e.actor+" "+(e.item_key||"")).toLowerCase().includes(q))).slice(-200);
+  const evs=S.events.filter(e=>(!only||["message","qa","help","comment"].includes(e.kind))&&(!q||(e.text+" "+e.actor+" "+(e.item_key||"")).toLowerCase().includes(q))).slice(-200);
   const f=$("feed"),atBottom=f.scrollHeight-f.scrollTop-f.clientHeight<40,prev=f.scrollTop;
   f.innerHTML=evs.map(e=>`<div class="ev ${evClass(e)}"><div class="av ${esc(roleOf(e.actor))}">${ini(e.actor)}</div><div style="min-width:0;flex:1">
     <div><span class="who">${esc(e.actor)}</span>${e.item_key?` <a href="#" data-key="${esc(e.item_key)}" class="mono">${esc(e.item_key)}</a>`:""}<span class="when">${ago(e.ts)}</span></div>
@@ -473,12 +532,12 @@ function detail(key){const t=S.items.find(i=>i.key===key);if(!t)return;openKey=k
    <div class="sec">History</div>${evs.map(e=>`<div class="ev ${evClass(e)}" style="padding:6px 0"><div class="av ${esc(roleOf(e.actor))}">${ini(e.actor)}</div><div style="min-width:0"><span class="who">${esc(e.actor)}</span><span class="when">${esc((e.ts||"").slice(11,19))}</span><div class="txt" style="-webkit-line-clamp:unset">${esc(e.text)}</div></div></div>`).join("")||`<div class="sub">No history yet</div>`}`;
   if(!$("dlg").open)$("dlg").showModal()}
 
-function render(){keepScroll(()=>{renderHeader();renderBanner();renderNav();renderCrumb();renderTeam();
+function render(){keepScroll(()=>{renderHeader();renderBanner();renderNow();renderNav();renderCrumb();renderTeam();
   view==="board"?renderBoard():renderList();renderFeed();if($("dlg").open&&openKey)detail(openKey)})}
 async function poll(){try{const r=await fetch("api/board?since="+since);const d=await r.json();
-    S.items=d.items;S.agents=d.agents;S.meta=d.meta;S.messages=d.messages;
+    S.items=d.items;S.agents=d.agents;S.meta=d.meta;S.messages=d.messages;S.progress=d.progress||{};S.live=d.live||{};S.now=d.now||Date.now()/1000;
     if(d.events.length){S.events=since?S.events.concat(d.events).slice(-800):d.events;since=d.events[d.events.length-1].id}
-    const sig=JSON.stringify([d.items,d.agents,d.meta,since]);if(sig!==lastSig){lastSig=sig;render()}
+    const sig=JSON.stringify([d.items,d.agents,d.meta,since,d.progress,d.live]);if(sig!==lastSig){lastSig=sig;render()}
   }catch(e){$("runstate").textContent="offline";$("rundot").className="dot needs-human"}finally{setTimeout(poll,1500)}}
 
 /* events */
@@ -518,6 +577,167 @@ poll();
 </body>
 </html>
 """
+
+
+_PROGRESS = {"at": 0.0, "data": {}}
+
+
+def _git(cwd: Path, *args: str) -> str:
+    try:
+        return subprocess.run(["git", *args], cwd=cwd, capture_output=True, text=True, encoding="utf-8",
+                              errors="replace", timeout=10).stdout
+    except Exception:
+        return ""
+
+
+def live_progress(board: Board, root: Path, cfg: dict) -> dict:
+    """Per in-progress task: planned files written so far, whether it is committed, and when its worktree last
+    changed — read straight from the developer's git worktree, so the board moves while the work happens."""
+    if time.time() - _PROGRESS["at"] < 4:
+        return _PROGRESS["data"]
+    out: dict = {}
+    try:
+        meta = board.meta()
+        integ = meta.get("integration_branch") or ""
+        wt_root = root / ((cfg.get("team") or {}).get("worktree_dir") or ".sdlc/worktrees")
+        tasks = [t for t in board.items(type_="task") if t["status"] in ("in_progress", "blocked") and t.get("assignee")]
+        by_wt: dict = {}
+        for t in tasks:
+            by_wt.setdefault(t["assignee"], []).append(t)
+        for agent, ts in by_wt.items():
+            wt = wt_root / agent
+            if not (wt / ".git").exists() or not integ:
+                continue
+            changed = set(_git(wt, "diff", "--name-only", f"{integ}...HEAD").split())
+            for line in _git(wt, "status", "--porcelain", "-uall").splitlines():
+                path = line[3:].strip().strip('"')
+                if " -> " in path:
+                    path = path.split(" -> ")[-1]
+                if path:
+                    changed.add(path.replace("\\", "/"))
+            changed = {c for c in changed if not c.startswith(".sdlc/")}
+            subjects = _git(wt, "log", "--format=%s", f"{integ}..HEAD").splitlines()
+            newest, newest_file = 0.0, ""
+            for c in changed:
+                try:
+                    m = (wt / c).stat().st_mtime
+                except OSError:
+                    continue
+                if m > newest:
+                    newest, newest_file = m, c
+            for t in ts:
+                planned = [f.replace("\\", "/") for f in (t.get("files") or [])]
+                done = [f for f in planned if f in changed or any(c.startswith(f.rstrip("/") + "/") for c in changed)]
+                out[t["key"]] = {"files_done": len(done), "files_total": len(planned), "changed": len(changed),
+                                 "committed": any(sub.startswith(t["key"] + ":") for sub in subjects),
+                                 "last_change": newest, "last_file": newest_file}
+    except Exception:
+        pass
+    _PROGRESS.update(at=time.time(), data=out)
+    return out
+
+
+_LIVE = {"at": 0.0, "data": {}}
+_AGENT_RE = re.compile(r"assignments[\\/]+((?:dev|qa)-\d+|designer)-")
+
+
+def _describe(block: dict, root: str) -> str | None:
+    if block.get("type") == "text" and (block.get("text") or "").strip():
+        return "💭 " + " ".join(block["text"].split())[:110]
+    if block.get("type") != "tool_use":
+        return None
+    n, i = block.get("name", ""), block.get("input") or {}
+    rel = lambda f: re.split(r"worktrees[\\/][^\\/]+[\\/]", str(f or ""))[-1].replace("\\", "/")
+    if n == "Bash":
+        cmd = re.sub(r'^\s*cd\s+("[^"]*"|\S+)\s*&&\s*', "", " ".join((i.get("command") or "").split()))
+        return "$ " + cmd[:110]
+    if n in ("Edit", "Write", "MultiEdit", "NotebookEdit"):
+        return f"{'write' if n == 'Write' else 'edit'} {rel(i.get('file_path'))}"
+    if n == "Read":
+        return f"read {rel(i.get('file_path'))}"
+    if n in ("Grep", "Glob"):
+        return f"search {str(i.get('pattern') or '')[:60]}"
+    if n.startswith("mcp__playwright__"):
+        return f"browser: {n.split('__')[-1].replace('browser_', '')} {str(i.get('url') or i.get('element') or '')[:60]}"
+    if n == "Skill":
+        return f"skill: {i.get('skill', '')}"
+    if n == "SendMessage":
+        msg = str(i.get("message") or "")
+        return ("✓ " + msg[:100]) if msg.lower().startswith("done") else f"message → {i.get('to', '')}: {msg[:70]}"
+    if n == "SubagentHandback":
+        return "✓ " + str(i.get("message") or "finished")[:100]
+    if n in ("TaskUpdate", "TaskCreate", "TaskList", "TaskGet"):
+        return None
+    return n
+
+
+def _first_prompt_agent(head: str) -> str | None:
+    for line in head.splitlines():
+        try:
+            d = json.loads(line)
+        except Exception:
+            continue
+        if d.get("type") != "user":
+            continue
+        c = (d.get("message") or {}).get("content")
+        text = c if isinstance(c, str) else " ".join(x.get("text", "") for x in c or [] if isinstance(x, dict)
+                                                    and x.get("type") == "text")
+        if not text.strip():
+            continue
+        m = _AGENT_RE.search(text) or re.search(r"\byou are ((?:dev|qa)-\d+|designer)\b", text, re.I)
+        return m.group(1).lower() if m else None
+    return None
+
+
+def live_activity(root: Path) -> dict:
+    """What every agent-team teammate is doing right now, read from Claude Code's own transcripts
+    (~/.claude/projects/*/<session>/subagents/agent-*.jsonl) — the same data its agent panel shows. No hooks."""
+    if time.time() - _LIVE["at"] < 2.5:
+        return _LIVE["data"]
+    out: dict = {}
+    try:
+        base = Path(os.environ.get("CLAUDE_CONFIG_DIR") or Path.home() / ".claude") / "projects"
+        want = str(root).replace("\\", "/").rstrip("/").lower()
+        cutoff = time.time() - 6 * 3600
+        for f in base.glob("*/**/*.jsonl"):  # every recent transcript; a teammate's starts with its assignment
+            try:
+                st = f.stat()
+                if st.st_mtime < cutoff:
+                    continue
+                with open(f, "rb") as fh:
+                    head = fh.read(16384).decode("utf-8", "replace")
+                    fh.seek(max(0, st.st_size - 65536))
+                    tail = fh.read().decode("utf-8", "replace")
+            except OSError:
+                continue
+            m = re.search(r'"cwd"\s*:\s*"((?:[^"\\]|\\.)*)"', head)
+            cwd = json.loads('"' + m.group(1) + '"').replace("\\", "/").rstrip("/").lower() if m else ""
+            if cwd != want and not cwd.startswith(want + "/"):
+                continue
+            agent = _first_prompt_agent(head)  # only the first prompt names the teammate (the lead's own
+            if not agent:                      # transcript mentions every assignment, so never read names elsewhere)
+                continue
+            last, ts = None, ""
+            for line in reversed(tail.splitlines()):
+                try:
+                    d = json.loads(line)
+                except Exception:
+                    continue
+                if d.get("type") != "assistant":
+                    continue
+                for blk in reversed((d.get("message") or {}).get("content") or []):
+                    last = _describe(blk, str(root))
+                    if last:
+                        break
+                if last:
+                    ts = d.get("timestamp") or ""
+                    break
+            if last and (agent not in out or ts > out[agent]["ts"]):
+                out[agent] = {"text": last, "ts": ts}
+    except Exception:
+        pass
+    _LIVE.update(at=time.time(), data=out)
+    return out
 
 
 class Handler(BaseHTTPRequestHandler):
@@ -574,7 +794,11 @@ class Handler(BaseHTTPRequestHandler):
             self.wfile.write(body)
         elif u.path == "/api/board":
             since = int((parse_qs(u.query).get("since") or ["0"])[0] or 0)
-            self._json(self.board.snapshot(since=since))
+            snap = self.board.snapshot(since=since)
+            snap["progress"] = live_progress(self.board, self.root, self.cfg) if self.root else {}
+            snap["live"] = live_activity(self.root) if self.root else {}
+            snap["now"] = time.time()
+            self._json(snap)
         else:
             self._json({"error": "not found"}, 404)
 
