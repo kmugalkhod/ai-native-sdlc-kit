@@ -106,39 +106,62 @@ Also: `/sdlc:bugfix` (failing-test-first + test lock), `/sdlc:triage` (incident 
 | 6 Maintain · gates between stages | `gatekeeper` agent + deterministic checks; `ESCALATION.md` hands off to a human |
 | Measure | `sdlc.py metrics`: intent→spec h, spec→plan h, rework after plan, survival rate |
 
-## Agent team — Epic → Stories → Tasks, developers + QA, live kanban
+## Agent team — Epic → Stories → Tasks, developers + QA, live kanban  *(beta)*
 
 ![Live team board](docs/team-board.png)
+
+> **Beta.** The single-agent loop (`/sdlc:loop`) is the stable path. The agent team is new: it is tested with real
+> Claude teammates on small projects and in CI on Linux, macOS and Windows, but not yet on many real codebases.
+> Report what breaks.
 
 ```text
 /sdlc:team <change>            # or: /sdlc:loop <idea> --team
 ```
 
-1. **Plan** — a planner agent turns the accepted intent/spec/plan into `breakdown.json`: one Epic, Stories,
-   and small file-disjoint Tasks with dependencies, acceptance criteria and a QA note. It lands on the board
-   and, if configured, in **Jira** (Epic → Story → Sub-task) or **Linear** (Project → issue → sub-issue).
-2. **Assign** — the lead (deterministic Python, never writes code) assigns tasks to developer agents, respects
-   dependencies, keeps two developers off the same files, and rebalances when someone is free.
-3. **Develop** — every developer agent has **its own git worktree** (`.sdlc/worktrees/dev-N`) and a branch per
-   task. It implements, runs verify until green, commits, and hands off with `board.py submit`.
-4. **QA** — a QA agent takes the hand-off in its own worktree, the lead starts the app on a free port, and QA
-   tests each acceptance criterion **in a real browser** (Playwright MCP) and via the API, adds automated tests,
-   then `qa-pass` or `qa-fail` with a bug report. A failed task goes straight back to its developer.
-5. **Talk & help** — agents message each other (`board.py ask/reply/inbox`). A developer who runs
-   `board.py blocked` gets an idle teammate sent to read their worktree and answer. Repeated trouble escalates
-   to a human. You can message any agent from the board page. To send an escalated task back, click
-   **Resume with guidance** on it (or `python3 .sdlc/bin/board.py resume T-7 "what to do"`) and re-run `team.py run`.
-   QA fails UI work only for deviations a user would notice; pixel-level nits are reported in the PASS.
-6. **Merge** — QA-passed work merges into `team/<change>`; a conflict goes back to the developer. At the end the
-   lead runs verify on the integrated branch and commits `team-report.md`. Nothing is pushed to main.
+**Fast mode — Claude Code Agent Teams (recommended).** Enable once in `~/.claude/settings.json`:
+`{"env": {"CLAUDE_CODE_EXPERIMENTAL_AGENT_TEAMS": "1"}}`. Your Claude Code window becomes the **team lead** and
+runs persistent teammates — `dev-1`, `dev-2`, `qa-1`, `designer` — that start once and keep their context for the
+whole run. You watch and talk to each of them in the agent panel.
+
+1. **Plan** — `breakdown.json`: one Epic, Stories, small file-disjoint Tasks with dependencies, acceptance
+   criteria and a QA note; on the board and, if configured, in **Jira** or **Linear**.
+2. **Prepare** — `team.py prepare` creates one git worktree per teammate, installs dependencies in all of them in
+   parallel, and recovers anything an earlier session left behind.
+3. **Assign by story** — `team.py next` (deterministic, < 1 s) hands each free developer a whole story — its ready
+   tasks, in order, on one branch. The lead only relays the assignment; teammates never wait for bookkeeping.
+4. **Develop** — in its own worktree: implement, test only what changed while working, one full verify at the
+   end, commit, `board.py submit`. Scaffolding comes from generators.
+5. **QA by story** — when a story is handed over, the lead starts the app on a free port and a QA teammate checks
+   every acceptance criterion (API + one real-browser pass), adds tests, and gives a verdict per task. A failure
+   goes back to the same developer — who still has the context. Pure setup tasks (`"qa": "none"`) are verified by
+   the lead instead of a QA run.
+6. **Merge by story** — a fully passed story merges into `team/<change>` in one go; conflicts go back to the
+   developer. `team.py wrap` runs the full verify on the team branch and commits `team-report.md`. Nothing is pushed
+   to main.
+
+Blocked teammates get help from an idle one; repeated trouble escalates to you (*Resume with guidance* on the board,
+or `board.py resume`). Design approval and resume are human-only: teammates act on the board as
+`board.py --as <name>`, and a named agent can never approve.
+
+A real run (4 tasks, 2 developers + QA, Sonnet teammates): planned → built → QA'd → merged in about 3 minutes,
+integration verify green.
+
+**Background mode** (Agent Teams off): `team.py run` starts a separate headless Claude per task — works unattended,
+but slower (every task starts cold).
 
 ```bash
 python3 .sdlc/bin/board_server.py                 # live board: http://127.0.0.1:8765
 python3 .sdlc/bin/team.py plan <change>           # breakdown only
-python3 .sdlc/bin/team.py run <change> --developers 3 --qa 1
-python3 .sdlc/bin/team.py run <change> --simulate # scripted agents, no model calls — try the board in 30 s
+python3 .sdlc/bin/team.py prepare <change>        # agent-teams mode: worktrees + first assignments (JSON)
+python3 .sdlc/bin/team.py next <change> --done dev-1   # next assignments after a teammate finished
+python3 .sdlc/bin/team.py wrap <change>           # final verify + team report
+python3 .sdlc/bin/team.py allow                   # pre-approve teammates' commands (push stays denied)
+python3 .sdlc/bin/team.py run <change> --developers 3 --qa 1   # background mode
 python3 .sdlc/bin/team.py status
 ```
+
+Commands in `.sdlc/config.json` are made portable at run time: `npm --prefix DIR install` runs inside `DIR`, and
+`.venv/bin/…` becomes `.venv\Scripts\…` on Windows — no per-OS config.
 
 **Designer (UI changes only).** When any task changes what users see, the breakdown adds **D-1 Design**. A
 designer agent, in its own worktree, uses the [impeccable](https://impeccable.style) skill:
@@ -184,8 +207,12 @@ tickets and comment. Status names are configurable (`tracker.jira.transitions`, 
 Agents aren't Jira/Linear users, so the assignee is a label; set `assignee_account_id` / `assignee_id` to also
 assign a real (bot) account.
 
-**Cost:** each agent is its own Claude session, so 2 developers + 1 QA is roughly 3× the usage of one session
+**Cost:** each teammate is its own Claude session, so 2 developers + 1 QA is roughly 3× the usage of one session
 while they work in parallel. On a Pro plan start with `--developers 1`.
+
+**Tests** (`.github/workflows/test.yml`, Linux · macOS · Windows): `tests/test_teamlead.py` drives a whole team run
+with scripted teammates — story batching, design gate, a QA failure, a blocked task, a session crash and restart;
+`tests/test_portable.py` runs the config commands for real (npm + venv); `tests/test_trackers.py` the Jira/Linear sync.
 
 ## Dependencies
 

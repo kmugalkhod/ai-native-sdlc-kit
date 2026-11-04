@@ -295,7 +295,25 @@ def guard(cond: bool, msg: str) -> None:
         sys.exit(f"refused: {msg}")
 
 
+def take_identity(argv: list[str]) -> list[str]:
+    """Agent-team teammates share one session environment, so they say who they are: --as dev-1 --role developer.
+    A named agent is never the human, so human-only actions (design approval, resume) stay refused."""
+    out, i = [], 0
+    while i < len(argv):
+        if argv[i] in ("--as", "--role") and i + 1 < len(argv):
+            os.environ["SDLC_AGENT" if argv[i] == "--as" else "SDLC_ROLE"] = argv[i + 1]
+            i += 2
+            continue
+        out.append(argv[i])
+        i += 1
+    if os.environ.get("SDLC_AGENT") == "human":  # nobody can claim to be the human through --as
+        os.environ.pop("SDLC_AGENT")
+        sys.exit("--as human is not allowed; humans run board.py without --as")
+    return out
+
+
 def main() -> None:
+    sys.argv[1:] = take_identity(sys.argv[1:])
     ap = argparse.ArgumentParser(prog="board", description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     sub = ap.add_subparsers(dest="cmd", required=True)
     s = sub.add_parser("show"); s.add_argument("--json", action="store_true")

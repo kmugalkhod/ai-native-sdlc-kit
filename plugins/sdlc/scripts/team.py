@@ -24,6 +24,7 @@ Everything is visible live in the board page: python .sdlc/bin/board_server.py
 from __future__ import annotations
 
 import argparse
+import contextlib
 import hashlib
 import json
 import os
@@ -43,7 +44,7 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 from board import Board, STATUS_LABEL  # noqa: E402
 from sdlc_core import (audit, changes, find_root, git, header_field, load_config, matches_any,  # noqa: E402
-                       setup_signature, utcnow)
+                       portable_cmd, setup_signature, utcnow)
 import trackers  # noqa: E402
 
 BOARD_CLI = "python3 .sdlc/bin/board.py"
@@ -58,12 +59,39 @@ QA_BASH = ["Bash(curl *)", "Bash(.venv/bin/*)", "Bash(python3 -m pytest*)", "Bas
 
 
 def log(msg: str) -> None:
-    print(f"[{time.strftime('%H:%M:%S')}] {msg}", flush=True)
+    out = sys.stderr if os.environ.get("SDLC_LOG_STDERR") else sys.stdout
+    print(f"[{time.strftime('%H:%M:%S')}] {msg}", file=out, flush=True)
 
 
 def sh(cmd, cwd, timeout=600, env=None) -> subprocess.CompletedProcess:
     return subprocess.run(cmd, cwd=cwd, shell=isinstance(cmd, str), capture_output=True, text=True, encoding="utf-8", errors="replace",
                           timeout=timeout, env=env)
+
+
+NEW_GROUP = ({"creationflags": subprocess.CREATE_NEW_PROCESS_GROUP} if os.name == "nt" else {"start_new_session": True})
+
+
+def kill_tree(proc) -> None:
+    """Kill a process and everything it started. On Windows terminate() leaves the children (npm, node, uvicorn)
+    running, still holding file locks and ports."""
+    if not proc or proc.poll() is not None:
+        return
+    try:
+        if os.name == "nt":
+            subprocess.run(["taskkill", "/PID", str(proc.pid), "/T", "/F"], capture_output=True, timeout=30)
+        else:
+            os.killpg(proc.pid, signal.SIGKILL)
+    except Exception:
+        try:
+            proc.kill()
+        except Exception:
+            pass
+
+
+def port_free(port: int) -> bool:
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as so:
+        so.settimeout(0.5)
+        return so.connect_ex(("127.0.0.1", port)) != 0
 
 
 def resolve_change(root: Path, cfg: dict, name: str) -> Path:
@@ -89,9 +117,10 @@ class AgentRun:
 
     def __init__(self, board: Board, name: str, cwd: Path, prompt: str, model: str, tools: list[str],
                  item_key: str | None, timeout_min: int, mcp: dict | None = None, extra_env: dict | None = None,
-                 add_dirs: list[str] | None = None, plugin_dir: str | list | None = None):
+                 add_dirs: list[str] | None = None, plugin_dir: str | list | None = None, stall_min: float = 12):
         self.b, self.name, self.cwd, self.item_key = board, name, cwd, item_key
-        self.cmd = ["claude", "-p", prompt, "--model", model, "--output-format", "stream-json", "--verbose",
+        self.prompt = prompt
+        self.cmd = ["claude", "-p", "--model", model, "--output-format", "stream-json", "--verbose",
                     "--permission-mode", "acceptEdits", "--allowedTools", *tools,
                     "--disallowedTools", "Bash(git push*)"]
         if mcp:
@@ -105,6 +134,7 @@ class AgentRun:
                 self.cmd += ["--plugin-dir", d]
         self.env = {**os.environ, "PYTHONIOENCODING": "utf-8", "PYTHONUTF8": "1", **(extra_env or {})}
         self.timeout = timeout_min * 60
+        self.stall_min = float(stall_min)
         self.proc: subprocess.Popen | None = None
         self.result_text, self.cost, self.error = "", 0.0, None
 
@@ -125,45 +155,73 @@ class AgentRun:
         return None
 
     def run(self) -> None:
-        started = time.time()
-        try:
-            self.proc = subprocess.Popen(self.cmd, cwd=self.cwd, env=self.env, stdout=subprocess.PIPE,
-                                         stderr=subprocess.PIPE, text=True, encoding="utf-8", errors="replace", bufsize=1)
-            for line in self.proc.stdout:
-                if time.time() - started > self.timeout:
+        started = last = time.time()
+        log_dir = Path(self.b.path).parent / "logs"
+        log_dir.mkdir(parents=True, exist_ok=True)
+        err_path = log_dir / f"{self.name}-{self.item_key or 'x'}-{time.strftime('%Y%m%d-%H%M%S')}.stderr.log"
+        stall = int(self.stall_min * 60)
+        done = threading.Event()
+
+        def watchdog():  # enforces the limits even when the agent is silent (e.g. a hung npm/pip command)
+            while not done.wait(5):
+                now = time.time()
+                if now - started > self.timeout:
                     self.error = f"timed out after {self.timeout // 60} min"
-                    self.proc.kill()
-                    break
-                try:
-                    ev = json.loads(line)
-                except json.JSONDecodeError:
+                elif stall and now - last > stall:
+                    self.error = f"stalled: no activity for {stall // 60} min (a command probably hung)"
+                else:
                     continue
-                if ev.get("type") == "assistant":
-                    for blk in (ev.get("message") or {}).get("content") or []:
-                        if blk.get("type") == "tool_use":
-                            d = self.describe(blk)
-                            if d:
-                                self.b.upsert_agent(self.name, activity=d)
-                                if not d.startswith(("$ python3 .sdlc/bin/board.py", "$ python .sdlc/bin/board.py")):
-                                    self.b.event(self.item_key, self.name, "activity", d)
-                        elif blk.get("type") == "text" and blk.get("text", "").strip():
-                            self.b.upsert_agent(self.name, activity="💭 " + blk["text"].strip()[:140])
-                elif ev.get("type") == "result":
-                    self.result_text = ev.get("result") or ""
-                    self.cost = ev.get("total_cost_usd") or 0.0
-                    if ev.get("is_error"):
-                        self.error = (self.result_text or "claude reported an error")[:500]
-            self.proc.wait(timeout=30)
+                kill_tree(self.proc)
+                return
+        try:
+            exe = shutil.which(self.cmd[0]) or self.cmd[0]
+            with open(err_path, "w", encoding="utf-8", errors="replace") as err:
+                self.proc = subprocess.Popen([exe, *self.cmd[1:]], cwd=self.cwd, env=self.env, stdin=subprocess.PIPE,
+                                             stdout=subprocess.PIPE, stderr=err, text=True, encoding="utf-8",
+                                             errors="replace", bufsize=1, **NEW_GROUP)
+                threading.Thread(target=watchdog, daemon=True).start()
+                try:  # the prompt goes in on stdin: no command-line length limit (cmd.exe stops at 8191 chars)
+                    self.proc.stdin.write(self.prompt)
+                    self.proc.stdin.close()
+                except OSError:
+                    pass
+                for line in self.proc.stdout:
+                    last = time.time()
+                    try:
+                        ev = json.loads(line)
+                    except json.JSONDecodeError:
+                        continue
+                    if ev.get("type") == "assistant":
+                        for blk in (ev.get("message") or {}).get("content") or []:
+                            if blk.get("type") == "tool_use":
+                                d = self.describe(blk)
+                                if d:
+                                    self.b.upsert_agent(self.name, activity=d)
+                                    if not d.startswith(("$ python3 .sdlc/bin/board.py", "$ python .sdlc/bin/board.py")):
+                                        self.b.event(self.item_key, self.name, "activity", d)
+                            elif blk.get("type") == "text" and blk.get("text", "").strip():
+                                self.b.upsert_agent(self.name, activity="💭 " + blk["text"].strip()[:140])
+                    elif ev.get("type") == "result":
+                        self.result_text = ev.get("result") or ""
+                        self.cost = ev.get("total_cost_usd") or 0.0
+                        if ev.get("is_error"):
+                            self.error = (self.result_text or "claude reported an error")[:500]
+                try:
+                    self.proc.wait(timeout=30)
+                except subprocess.TimeoutExpired:
+                    kill_tree(self.proc)
             if self.proc.returncode and not self.error:
-                self.error = (self.proc.stderr.read() or f"exit {self.proc.returncode}")[-500:]
+                tail = err_path.read_text(encoding="utf-8", errors="replace")[-500:].strip()
+                self.error = tail or f"exit {self.proc.returncode}"
         except Exception as e:  # never let one agent crash the team
             self.error = str(e)[:500]
         finally:
+            done.set()
+            kill_tree(self.proc)  # leftover children (npm, node, uvicorn, browsers) must not hold locks or ports
             self.b.add_cost(self.name, self.cost)
 
     def stop(self) -> None:
-        if self.proc and self.proc.poll() is None:
-            self.proc.terminate()
+        kill_tree(self.proc)
 
 
 class SimulatedRun(AgentRun):
@@ -227,11 +285,17 @@ Rules:
   Keep tasks file-disjoint where possible so parallel developers don't collide.
 - Plan for parallel work: with {devs} developers, at least {devs} tasks should be startable right after the first
   one. A task depends only on tasks whose code it truly needs.
+- Keep chains short: no dependency chain longer than 3 tasks after the skeleton, and no single task that more than a
+  third of the tasks wait on. When later work only needs an interface (a provider base class, a DB model, an API
+  client), put that interface in the skeleton or an early small task and let the work depend on that, not on the
+  full feature. Different stories should be buildable side by side.
 - If the project needs a skeleton, keep it SMALL (under 15 minutes): entry point, package layout, dependency
   manifests, config loading, test setup — no features. If there is a backend and a frontend, make them two separate
   skeleton tasks with no dependency between them, and let each later task depend only on the skeleton it builds on.
 - depends_on uses task ids from this file. No cycles.
 - Each task has testable acceptance criteria and a "qa" note: how a QA agent proves it in a browser or via the API.
+  For pure setup tasks with nothing a user can try (skeleton, config, tooling, CI), set "qa": "none" — the lead
+  checks those with verify instead of a QA agent.
 - Mark "ui": true on every task that creates or changes something a user sees (pages, components, styles, copy),
   and set the top-level "ui" true if the change has any UI. A designer agent designs those before they are built,
   so UI tasks wait for the design approval and everything else starts at once.
@@ -375,7 +439,7 @@ def load_breakdown(root: Path, cfg: dict, change: Path, data: dict, devs: int) -
                integration_branch=f"{cfg['team']['branch_prefix']}{change.name}")
     e = b.add_item("epic", data["epic"]["title"], description=data["epic"].get("description", ""))
     idmap, dev_names = {}, [f"dev-{i + 1}" for i in range(devs)]
-    pending = []
+    pending, no_qa = [], []
     for s in data["stories"]:
         sk = b.add_item("story", s["title"], e, description=s.get("description", ""),
                         acceptance=s.get("acceptance", []))
@@ -388,6 +452,8 @@ def load_breakdown(root: Path, cfg: dict, change: Path, data: dict, devs: int) -
             is_ui = bool(t["ui"]) if "ui" in t else \
                 any(matches_any(f, cfg["team"]["design"]["ui_globs"]) for f in t.get("files", []))
             pending.append((tk, t.get("depends_on", []), is_ui))
+            if str(t.get("qa", "")).strip().lower() in ("none", "skip", "-", "n/a") and not is_ui:
+                no_qa.append(tk)
     # guard: the foundation task must never wait for the design. A "UI" task with no dependencies of its own that
     # non-UI tasks build on directly (typically the skeleton with a placeholder page) starts at once. Real screens
     # (app shell, pages) depend on something, so they keep waiting for the approved design.
@@ -428,6 +494,7 @@ def load_breakdown(root: Path, cfg: dict, change: Path, data: dict, devs: int) -
         load[owner] += 1
         b.update(tk, "lead", depends_on=json.dumps(keys), assignee=owner)
         b.event(tk, "lead", "assign", f"assigned to {owner}")
+    b.set_meta(no_qa=no_qa)
     b.event(None, "lead", "system", f"plan loaded: {len(data['stories'])} stories, {len(pending)} tasks, "
                                     f"{devs} developers" + (f", design {design_key} first for {len(ui_tasks)} UI task(s)"
                                                             if design_key else ", no UI — no designer needed"))
@@ -482,12 +549,14 @@ Files you own for this task: {files}
 Acceptance criteria:
 {acceptance}
 
-It belongs to story {story_key} "{story_title}" of epic "{epic_title}". For the big picture read
-{rel}/intent.md, {rel}/spec.md, {rel}/plan.md and {rel}/breakdown.json. Follow CLAUDE.md.
+It belongs to story {story_key} "{story_title}" of epic "{epic_title}". Everything you need is above; look things up
+in {rel}/spec.md or {rel}/plan.md only when a detail is missing (search them, don't read them whole). Follow CLAUDE.md.
 {extra}
 How to work:
 1. Check messages first: {cli} inbox  (check again after each major step — teammates may answer you).
-2. Implement the task. New packages go into the manifest (requirements.txt / package.json) and are installed by
+2. Implement the task. Scaffolding (a new frontend/backend project, config files) comes from the official
+   generators — e.g. `npm create vite@latest frontend -- --template react-ts`, then adjust — instead of typing every
+   file yourself. New packages go into the manifest (requirements.txt / package.json) and are installed by
    `python3 .sdlc/bin/sdlc.py verify setup` — never pip/npm install by hand.
 3. Write or extend tests for the acceptance criteria. While iterating run only the narrowest check (one test file,
    e.g. `python3 -m pytest tests/test_x.py -q`, or one npm script). Run the full `python3 .sdlc/bin/sdlc.py verify`
@@ -510,7 +579,9 @@ Story {story_key} "{story_title}" acceptance: {story_acceptance}
 The code is checked out in your own worktree {wt} (branch {branch}).
 {app}
 Do this:
-1. {cli} inbox — then run `python3 .sdlc/bin/sdlc.py verify` (setup, build, tests, lint).
+1. {cli} inbox — then run `python3 .sdlc/bin/sdlc.py verify` (setup, build, tests, lint). If it fails because the
+   toolchain itself is broken (pip/npm install errors, missing tools) — not because of the code — do NOT debug or
+   work around it: `{cli} blocked {key} "verify setup fails: <the error>"` and stop. A human fixes the config.
 2. Test every acceptance criterion the way a user would. {browser}
    For APIs use curl. Try the edge cases a careful tester would (empty input, bad input, refresh, repeat).
 3. If a criterion has no automated test, add one under tests/ (e2e or API) and commit it:
@@ -622,6 +693,7 @@ class Lead:
         self.attempts: dict[str, int] = {}
         self.help_rounds: dict[str, int] = {}
         self.escalated: set[str] = set(self.b.meta().get("escalated", []))
+        self.pending: list[tuple] = []  # results from background prep threads, applied by the lead thread
         self.stop = threading.Event()
         try:
             self.tracker = trackers.make(cfg)
@@ -659,6 +731,15 @@ class Lead:
             if role:
                 self.b.upsert_agent(name, role=role, status="idle", item_key=None, activity="ready",
                                     worktree=str(p.relative_to(self.root)))
+        # a previous run that died (crash, Ctrl+C, closed terminal) can leave QA claims nobody holds: no agent is
+        # running yet, so every bare claim is stale — release it so QA picks the task up again
+        for t in self.b.items(type_="task"):
+            claim = t.get("qa_by") or ""
+            if t["status"] == "in_qa" and claim and ":" not in claim:
+                self.b.update(t["key"], "lead", qa_by=None)
+                self.b.event(t["key"], "lead", "system", f"released stale QA claim by {claim} from an earlier run")
+                log(f"{t['key']}: released stale QA claim by {claim}")
+        self.sync_bin()
         self.b.set_meta(status="running", started_at=utcnow(), integration_branch=self.integration,
                         team={"developers": self.devs, "qa": self.qas, "designers": self.designers})
         if self.design:
@@ -722,9 +803,38 @@ class Lead:
     def tasks(self) -> list[dict]:
         return self.b.items(type_="task")
 
+    def sync_bin(self) -> None:
+        """Agents run the helper scripts from their own worktree, i.e. from the team branch. After the human upgrades
+        the kit (init.py --upgrade-bin), copy the new scripts into the team branch so every new task uses them."""
+        src, iwt = self.root / ".sdlc" / "bin", self.wt("integration")
+        dst = iwt / ".sdlc" / "bin"
+        if not src.is_dir():
+            return
+        changed = []
+        for f in sorted(src.glob("*.py")):
+            target = dst / f.name
+            if not target.exists() or target.read_bytes() != f.read_bytes():
+                dst.mkdir(parents=True, exist_ok=True)
+                shutil.copy2(f, target)
+                changed.append(f.name)
+        if changed:
+            sh(["git", "add", ".sdlc/bin"], iwt)
+            sh(["git", "-c", "user.name=team-lead", "-c", "user.email=lead@sdlc.local", "commit", "-qm",
+                "sdlc: update kit scripts on the team branch"], iwt)
+            log(f"updated kit scripts on {self.integration}: {', '.join(changed)}")
+            self.b.event(None, "lead", "system", f"kit scripts updated on the team branch ({len(changed)} files)")
+
+    def has_work(self, t: dict, wt: Path) -> bool:
+        """The task's branch already carries commits beyond the integration branch and nothing sent it back."""
+        if not t.get("branch") or t["status"] != "in_progress" or t.get("qa_rounds"):
+            return False
+        n = sh(["git", "rev-list", "--count", f"{self.integration}..{t['branch']}"], wt).stdout.strip()
+        return n.isdigit() and int(n) > 0
+
     def busy(self, agent: str) -> bool:
         w = getattr(self, "warming", {}).get(agent)
-        return agent in self.running or bool(w and w.is_alive())
+        queued = any(j[0] == "qa" and j[1] == agent for j in getattr(self, "pending", []))
+        return agent in self.running or bool(w and w.is_alive()) or queued
 
     def warm(self, names: list[str]) -> None:
         """Install dependencies in idle agents' worktrees in the background, so agents don't spend their own time
@@ -740,6 +850,7 @@ class Lead:
 
             def job(n=n, wt=wt):
                 sh(["git", "checkout", "-q", "--detach", self.integration], wt)
+                self.fresh_bin(wt)
                 env = {**os.environ, "SDLC_SETUP_IF_CHANGED": "1", "PYTHONIOENCODING": "utf-8"}
                 r = sh([sys.executable, ".sdlc/bin/sdlc.py", "verify", "setup"], wt, timeout=1800, env=env)
                 skipped = "SKIP" in (r.stdout or "")
@@ -777,8 +888,21 @@ class Lead:
                 "story_acceptance": "; ".join(story.get("acceptance") or []) or "-",
                 "epic_title": epic.get("title"), "rel": self.rel, "cli": BOARD_CLI}
 
+    def fresh_bin(self, wt: Path) -> None:
+        """Every agent runs the lead's current helper scripts, whatever its branch was created with (a branch
+        made before a kit upgrade still carries the old .sdlc/bin)."""
+        src, dst = self.root / ".sdlc" / "bin", Path(wt) / ".sdlc" / "bin"
+        if not src.is_dir() or src.resolve() == dst.resolve():
+            return
+        dst.mkdir(parents=True, exist_ok=True)
+        for f in src.glob("*.py"):
+            target = dst / f.name
+            if not target.exists() or target.read_bytes() != f.read_bytes():
+                shutil.copy2(f, target)
+
     def launch(self, agent: str, role: str, kind: str, t: dict, prompt: str, cwd: Path, model: str,
                add_dirs=None, port=None, behaviour="") -> None:
+        self.fresh_bin(cwd)
         if self.a.simulate:
             run = SimulatedRun(self.b, agent, cwd, prompt, model, [], t["key"], 5,
                                extra_env=self.env_for(agent, role), role=kind, behaviour=behaviour)
@@ -786,6 +910,7 @@ class Lead:
             run = AgentRun(self.b, agent, cwd, prompt, model, self.tools_for(role), t["key"],
                            self.t["run_timeout_minutes"], mcp=self.mcp_for(role, port),
                            extra_env=self.env_for(agent, role), add_dirs=add_dirs,
+                           stall_min=self.t.get("stall_minutes", 12),
                            plugin_dir=[os.environ.get("SDLC_PLUGIN_DIR")] +
                                       (list(self.d.get("plugin_dirs") or []) if role == "designer" else []))
         th = threading.Thread(target=run.run, daemon=True, name=f"{agent}:{t['key']}")
@@ -813,7 +938,7 @@ class Lead:
             return
         others = ", ".join(n for n in self.devs + self.qas if n != agent)
         extra = ""
-        if self.attempts.get(t["key"]):
+        if self.attempts.get(t["key"]) or self.has_work(t, wt):
             extra += ("\nYOUR PREVIOUS RUN ON THIS TASK STOPPED (time limit or exit) BEFORE YOU SUBMITTED. Its work is "
                       "committed on your branch: read `git log --oneline -5` and `git diff " + self.integration + " --stat`, "
                       "CONTINUE from it — do not start over — get verify green and submit.\n")
@@ -837,17 +962,34 @@ class Lead:
                     self.t["models"]["developer"], behaviour=behaviour)
 
     def start_qa(self, agent: str, t: dict) -> None:
-        wt = self.wt(agent)
-        qa_branch = f"qa/{t['key']}"
-        sh("git reset -q --hard && git clean -qfd", wt)
-        r = sh(["git", "checkout", "-q", "-B", qa_branch, t["branch"]], wt)
-        if r.returncode:
-            self.escalate(t, f"QA could not check out {t['branch']}: {r.stderr.strip()[:200]}")
-            return
-        port = self.t["qa"]["port_base"] + self.qas.index(agent)
-        app = self.start_app(agent, wt, port)
+        """Claim the task now; check out, install and start the app in the background so the lead keeps
+        dispatching developers and merging while QA gets ready."""
         self.b.update(t["key"], "lead", qa_by=agent)
         self.b.event(t["key"], "lead", "assign", f"QA {agent} picked up {t['key']} from {t['assignee']}")
+        self.b.upsert_agent(agent, status="working", item_key=t["key"], activity="preparing: checkout, install, start app")
+        self.warming = getattr(self, "warming", {})
+
+        def prep():
+            try:
+                wt, qa_branch = self.wt(agent), f"qa/{t['key']}"
+                sh("git reset -q --hard && git clean -qfd", wt)
+                r = sh(["git", "checkout", "-q", "-B", qa_branch, t["branch"]], wt)
+                if r.returncode:
+                    self.pending.append(("escalate", t["key"], f"QA could not check out {t['branch']}: {r.stderr.strip()[:200]}"))
+                    return
+                self.fresh_bin(wt)
+                port = self.t["qa"]["port_base"] + self.qas.index(agent)
+                app = self.start_app(agent, wt, port)
+                self.pending.append(("qa", agent, t["key"], qa_branch, app))
+            except Exception as e:
+                self.pending.append(("escalate", t["key"], f"QA preparation failed: {e}"))
+        th = threading.Thread(target=prep, daemon=True, name=f"{agent}:prep:{t['key']}")
+        th.start()
+        self.warming[agent] = th
+
+    def launch_qa(self, agent: str, key: str, qa_branch: str, app: str | None) -> None:
+        t = self.b.item(key)
+        wt = self.wt(agent)
         browser = ("Use the browser tools (mcp__playwright__browser_navigate, browser_snapshot, browser_click, "
                    "browser_type, browser_take_screenshot) against the running app."
                    if self.t["qa"].get("browser") == "playwright-mcp" else
@@ -860,7 +1002,55 @@ class Lead:
         prompt = QA_PROMPT.format(**ctx)
         if self.design and self.design["key"] in t["depends_on"]:
             prompt += DESIGN_FOR_QA.format(mockup_url=self.mockup_url())
+        port = int(app.split(":")[2].split()[0].split("/")[0]) if app else None
         self.launch(agent, "qa", "qa", t, prompt, wt, self.t["models"]["qa"], port=port, behaviour=behaviour)
+
+    def lead_check(self, t: dict) -> None:
+        """Verify a no-QA task in its developer's worktree (still on the task branch) in the background."""
+        agent = t["assignee"]
+        self.b.update(t["key"], "lead", qa_by="lead")
+        self.b.event(t["key"], "lead", "assign", f"setup task — the lead verifies {t['key']} (no QA agent needed)")
+        self.warming = getattr(self, "warming", {})
+
+        def job():
+            wt = self.wt(agent)
+            if self.a.simulate or not any((self.cfg.get("verify") or {}).values()):
+                self.pending.append(("checked", t["key"], True, "no verify commands configured"))
+                return
+            sh(["git", "checkout", "-q", t["branch"]], wt)
+            self.fresh_bin(wt)
+            env = {**os.environ, "PYTHONIOENCODING": "utf-8"}
+            r = sh([sys.executable, ".sdlc/bin/sdlc.py", "verify"], wt, timeout=1800, env=env)
+            self.pending.append(("checked", t["key"], r.returncode == 0, (r.stdout + r.stderr).strip()[-600:]))
+        th = threading.Thread(target=job, daemon=True, name=f"lead:check:{t['key']}")
+        th.start()
+        self.warming[agent] = th  # keeps the developer's worktree on this branch until the check is done
+
+    def drain(self) -> None:
+        """Apply results that background preparation threads queued (only the lead thread touches dispatch)."""
+        while self.pending:
+            job = self.pending.pop(0)
+            if job[0] == "qa":
+                _, agent, key, qa_branch, app = job
+                self.launch_qa(agent, key, qa_branch, app)
+            elif job[0] == "checked":
+                _, key, ok, out = job
+                t = self.b.item(key)
+                if not t or t["status"] != "in_qa":
+                    continue
+                if ok:
+                    self.b.event(key, "lead", "qa", "PASS: setup task — verify green (checked by the lead)")
+                    self.b.update(key, "lead", qa_by="pass:lead")  # merged on the next tick
+                else:
+                    self.b.event(key, "lead", "qa", f"FAIL: verify is not green on {t['branch']}: {out}")
+                    self.b.update(key, "lead", note="verify failed in the lead's check", status="in_progress",
+                                  qa_rounds=(t.get("qa_rounds") or 0) + 1, qa_by="fail:lead")
+                    if t["assignee"]:
+                        self.b.send("lead", t["assignee"], f"{key}: verify failed when I checked it:\n{out}", key)
+            elif job[0] == "escalate":
+                t = self.b.item(job[1])
+                if t:
+                    self.escalate(t, job[2])
 
     def start_design(self, d: dict) -> None:
         agent, wt = "designer", self.wt("designer")
@@ -881,7 +1071,7 @@ class Lead:
                    if e["kind"] == "design" and e["text"].startswith("CHANGES:")]
         feedback = (f"\nTHE HUMAN ASKED FOR CHANGES (round {len(changes)}): {changes[-1]}\n"
                     "Update the design (keep what they did not mention), then design-ready again.\n") if changes else ""
-        if self.attempts.get(d["key"]) and not changes:
+        if (self.attempts.get(d["key"]) or self.has_work(d, wt)) and not changes:
             feedback += ("\nYOUR PREVIOUS RUN STOPPED BEFORE design-ready. Your files are committed in this worktree "
                          "(DESIGN.md, the mockup, the notes): check what is missing, finish only that, then commit and "
                          "run design-ready right away.\n")
@@ -912,16 +1102,22 @@ class Lead:
         cmd = (self.t["qa"].get("start_cmd") or "").strip()
         if not cmd or self.a.simulate:
             return None
-        setup = self.cfg["verify"].get("setup")
-        if setup:
-            sh(setup, wt, timeout=900)
-        proc = subprocess.Popen(cmd.replace("{port}", str(port)), shell=True, cwd=wt, stdout=subprocess.DEVNULL,
-                                stderr=subprocess.DEVNULL, env={**os.environ, "PORT": str(port)}, start_new_session=True)
+        if self.cfg["verify"].get("setup"):  # cached: a no-op when the worktree's dependencies are already installed
+            env = {**os.environ, "SDLC_SETUP_IF_CHANGED": "1", "PYTHONIOENCODING": "utf-8"}
+            sh([sys.executable, ".sdlc/bin/sdlc.py", "verify", "setup"], wt, timeout=1800, env=env)
+        for cand in [port + 10 * i for i in range(10)]:  # a crashed run may have left an app on the port
+            if port_free(cand):
+                port = cand
+                break
+        proc = subprocess.Popen(portable_cmd(cmd).replace("{port}", str(port)), shell=True, cwd=wt, stdout=subprocess.DEVNULL,
+                                stderr=subprocess.DEVNULL, env={**os.environ, "PORT": str(port)}, **NEW_GROUP)
         self.apps = getattr(self, "apps", {})
         self.apps[agent] = proc
         url = f"http://127.0.0.1:{port}"
         deadline = time.time() + self.t["qa"].get("start_timeout", 60)
         while time.time() < deadline:
+            if proc.poll() is not None:
+                return url + " (the app exited at startup — check start_cmd; report that in your verdict)"
             try:
                 urllib.request.urlopen(url + self.t["qa"].get("health_path", "/"), timeout=2)
                 return url
@@ -933,12 +1129,7 @@ class Lead:
         return url + " (it did not answer the health check — report that if it stays down)"
 
     def stop_app(self, agent: str) -> None:
-        p = getattr(self, "apps", {}).pop(agent, None)
-        if p and p.poll() is None:
-            try:
-                os.killpg(p.pid, signal.SIGTERM)
-            except Exception:
-                p.terminate()
+        kill_tree(getattr(self, "apps", {}).pop(agent, None))
 
     # ---------------------------------------------------------------- after a run
     def finished(self, agent: str) -> None:
@@ -1034,6 +1225,7 @@ class Lead:
     # ---------------------------------------------------------------- the loop
     def tick(self) -> None:
         self.escalated = set(self.b.meta().get("escalated", []))  # the human may resume one from the board
+        self.drain()
         for agent, (th, *_rest) in list(self.running.items()):
             if not th.is_alive():
                 self.finished(agent)
@@ -1065,6 +1257,12 @@ class Lead:
             if t["status"] == "in_qa" and (t.get("qa_by") or "").startswith("pass:") and not any(
                     r[2] == t["key"] for r in self.running.values()):
                 self.merge(t)
+        tasks = self.tasks()
+        # 2a. setup tasks the planner marked "qa": "none": the lead runs verify itself instead of a QA agent
+        no_qa = set(self.b.meta().get("no_qa") or [])
+        for t in tasks:
+            if t["status"] == "in_qa" and not t.get("qa_by") and t["key"] in no_qa:
+                self.lead_check(t)
         tasks = self.tasks()
         # 2. QA picks up hand-offs
         for t in tasks:
@@ -1178,6 +1376,787 @@ class Lead:
         return 0 if status == "done" else 3
 
 
+# ====================================================================== Claude Code agent-teams mode
+# The session you talk to is the team lead. It spawns persistent teammates (dev-1, dev-2, qa-1, designer) once and
+# relays assignments that this deterministic helper computes. All git, board, merge and app work happens here in
+# seconds; teammates only do the thinking. State lives on the board (meta "tl"), so every `team.py next` call is
+# stateless and a crashed or restarted session picks up where it was.
+
+TL_ROLES = {"developer": "sdlc:developer", "qa": "sdlc:qa", "designer": "sdlc:designer", "helper": "sdlc:developer"}
+
+TL_HEADER = """You are {agent}, the {role} on a Claude Code agent team. The team lead (the session that messaged you)
+gives you one assignment at a time. You stay alive between assignments, so keep what you learn about the codebase.
+
+YOUR WORKTREE: {wt}
+  Work ONLY there. Start every Bash command with  cd "{wt}" &&  and use absolute paths under it for Read/Edit/Write.
+  Never touch another teammate's worktree, never merge or push branches — the lead does that.
+BOARD CLI (always with your identity): {cli}
+"""
+
+TL_FOOTER = """
+When this assignment is finished (submitted / verdicts given / blocked / design-ready), send the team lead ONE short
+message: "done {keys}: <one line>". Then wait for the next assignment. Do not pick up other work yourself.
+Toolchain broken (installs fail, a tool is missing)? Don't fight it for more than two tries: report it with
+{cli} blocked <key> "<the error>" and tell the lead.
+"""
+
+TL_DEV = """ASSIGNMENT — story {story_key} "{story_title}" (epic "{epic_title}"), branch {branch}.
+Build these {n} task(s) in this order:
+{tasks}
+{extra}
+How to work (fast, and the quality bar does not move):
+1. The tasks above are your spec. Only when a detail is missing, search {rel}/spec.md or {rel}/plan.md — don't read
+   them whole. Follow CLAUDE.md.
+2. Scaffolding (a new frontend/backend project, config) comes from the official generators, e.g.
+   `npm create vite@latest frontend -- --template react-ts`, then adjust — don't hand-type boilerplate.
+3. New packages go into the manifest, then `{py} .sdlc/bin/sdlc.py verify setup`. Never install by hand.
+4. Keep the team informed — one short line each, people watch these live on the board:
+   at the start:     {cli} comment <first key> "started: <your plan in a few words>"
+   after each task:  {cli} comment <key> "done: <what works now> · next: <what you do next>"
+   Per task: implement, write its tests, run ONLY those tests (one file), commit:
+   git add -A && git commit -m "<key>: <what>"
+5. After the last task run the full `{py} .sdlc/bin/sdlc.py verify` once. It must be green — fix the code, never
+   weaken a test.
+6. Submit every task: {cli} submit <key> "what you built and how QA checks it"
+7. Questions: SendMessage the teammate who knows, or {cli} ask <name> "..." --task <key>.
+   Blocked: {cli} blocked <key> "exactly what you need".
+Budget: about {budget} minutes for this assignment.
+"""
+
+TL_QA = """ASSIGNMENT — QA for story {story_key} "{story_title}" on branch {branch} (built by {dev}).
+Tasks to verify:
+{tasks}
+{app}
+How to test (fast, thorough) — time budget: about {budget} minutes. Effort matches the size of the change.
+1. Your worktree is checked out at {branch} and its dependencies are installed. Run `{py} .sdlc/bin/sdlc.py verify test`
+   ONCE (don't re-run the whole suite after each check; re-run only a test file you added).
+   Post a line now and after every check, people watch them live on the board:
+   {cli} comment <key> "testing: <what you are checking now>"
+2. Prove every acceptance criterion the way a user would: API checks with curl, and ONE browser pass through the
+   story's user-visible flow{browser}. Try the edge cases a careful tester would (empty, bad input, refresh, repeat).
+   Don't fight tooling: if the browser or app won't start within a couple of minutes, verify through tests and API
+   calls instead and say so in the verdict. Don't install browsers or packages.
+3. A criterion without an automated test? Add one under tests/ and commit it (git add -A && git commit -m "<key>: QA
+   tests"). Do NOT change application code.
+4. One verdict per task, each with evidence:
+   {cli} qa-pass <key> "what you checked and the evidence"
+   {cli} qa-fail <key> "steps to reproduce · expected · actual"
+{design}"""
+
+
+class _Done:
+    error, result_text, cost = None, "", 0.0
+
+    def stop(self) -> None:
+        pass
+
+
+class _Alive:
+    def __init__(self, alive: bool):
+        self.alive = alive
+
+    def is_alive(self) -> bool:
+        return self.alive
+
+
+def kill_pid(pid) -> None:
+    if not pid:
+        return
+    try:
+        if os.name == "nt":
+            subprocess.run(["taskkill", "/PID", str(pid), "/T", "/F"], capture_output=True, timeout=30)
+        else:
+            os.killpg(int(pid), signal.SIGKILL)
+    except Exception:
+        pass
+
+
+class TeamLead(Lead):
+    """Deterministic side of an agent-teams run. Each call: finish jobs → design → merge → checks → QA → help →
+    developers, then return the assignments the session lead sends to its teammates."""
+
+    def __init__(self, root: Path, cfg: dict, change: Path, a, session_start: bool = False):
+        super().__init__(root, cfg, change, a)
+        st = self.b.meta().get("tl") or {}
+        self.jobs: dict = st.get("jobs", {})
+        self.spawned: list = [] if session_start else st.get("spawned", [])
+        self.attempts = st.get("attempts", {})
+        self.help_rounds = st.get("help_rounds", {})
+        self.apps: dict = st.get("apps", {})
+        self.no_base: set = set(st.get("no_base", []))
+        self.assignments: list = []
+        self.done_flags = set(getattr(a, "done", None) or [])
+        if session_start:  # teammates of an earlier session are gone: every open job ended without a result
+            self.done_flags |= set(self.jobs)
+        self.batch_max = int(self.t.get("batch_max", 4))
+        self.no_qa = set(self.b.meta().get("no_qa") or [])
+        self.designers = ["designer"] if self.design else []
+        self.board_url = f"http://127.0.0.1:{self.t.get('board_port', 8765)}"
+        self.adir = Path(self.b.path).parent / "assignments"
+        self.adir.mkdir(parents=True, exist_ok=True)
+
+    # ---------------------------------------------------------------- state
+    def save(self) -> None:
+        self.b.set_meta(tl={"jobs": self.jobs, "spawned": self.spawned, "attempts": self.attempts,
+                            "help_rounds": self.help_rounds, "apps": self.apps, "no_base": sorted(self.no_base)})
+
+    def busy(self, agent: str) -> bool:
+        w = getattr(self, "warming", {}).get(agent)
+        return agent in self.jobs or bool(w and w.is_alive())
+
+    def running_keys(self) -> set:
+        return {k for j in self.jobs.values() for k in j["keys"]}
+
+    def mockup_url(self, where: str = "integration") -> str:
+        if where == "designer":
+            return (self.wt("designer") / self.rel / "design" / "mockup.html").as_uri()
+        return f"{self.board_url}/design/{(self.design or {}).get('key', 'D-1')}"
+
+    def file_clash(self, t: dict, batch_files: set | None = None) -> str | None:
+        mine = set(t["files"])
+        for other in self.tasks():
+            if other["key"] != t["key"] and other["key"] in self.running_keys() and mine & set(other["files"]):
+                return other["key"]
+        return None
+
+    # ---------------------------------------------------------------- assignments
+    def assign(self, agent: str, role: str, kind: str, keys: list, title: str, body: str, wt: Path) -> None:
+        self.fresh_bin(wt)
+        cli = f"{BOARD_CLI} --as {agent} --role {'developer' if kind == 'helper' else role}"
+        text = (TL_HEADER.format(agent=agent, role=role, wt=wt, cli=cli)
+                + "\n" + body.replace(BOARD_CLI + " ", cli + " ")
+                + TL_FOOTER.format(keys=", ".join(keys), cli=cli))
+        n = len(list(self.adir.glob(f"{agent}-*.md"))) + 1
+        f = self.adir / f"{agent}-{n:03d}-{keys[0]}.md"
+        f.write_text(text, encoding="utf-8")
+        action = "send" if agent in self.spawned else "spawn"
+        if action == "spawn":
+            self.spawned.append(agent)
+        bm = re.search(r"budget:? about (\d+) minutes", text, re.I)
+        self.jobs[agent] = {"keys": keys, "kind": kind, "started": time.time(), "budget": int(bm.group(1)) if bm else 0}
+        model = self.t["models"].get("helper" if kind == "helper" else role, "sonnet")
+        self.assignments.append({
+            "agent": agent, "action": action, "agent_type": TL_ROLES[kind], "model": model, "keys": keys,
+            "title": title, "file": str(f),
+            "message": f"New assignment ({', '.join(keys)}): read {f} and do exactly what it says."})
+        status = {"designer": "designing", "helper": "helping"}.get(kind, "working")
+        self.b.upsert_agent(agent, status=status, item_key=keys[0], activity=f"assigned: {title[:80]}")
+        self.b.event(keys[0], "lead", "assign", f"{agent} ← {kind} {', '.join(keys)}")
+
+    def tasks_text(self, ts: list) -> str:
+        out = []
+        for t in ts:
+            ctx = self.context(t)
+            out.append(f"- {t['key']} {t['title']}\n  {ctx['description']}\n  Files: {ctx['files']}\n"
+                       f"  Acceptance:\n" + "\n".join("    " + x for x in ctx["acceptance"].splitlines()))
+        return "\n".join(out)
+
+    # ---------------------------------------------------------------- 1. finished jobs
+    def job_done(self, agent: str, j: dict) -> bool:
+        if agent in self.done_flags:
+            return True
+        ts = [self.b.item(k) or {} for k in j["keys"]]
+        kind = j["kind"]
+        if kind == "developer":
+            return all(t.get("status") != "in_progress" for t in ts)
+        if kind == "qa":
+            return all(t.get("status") != "in_qa" or (t.get("qa_by") or "").startswith(("pass:", "fail:")) for t in ts)
+        if kind == "designer":
+            return all(t.get("status") != "in_progress" for t in ts)
+        if kind == "helper":
+            return all(t.get("status") != "blocked" for t in ts)
+        return True
+
+    def finish_jobs(self) -> None:
+        for agent, j in list(self.jobs.items()):
+            if not self.job_done(agent, j):
+                continue
+            del self.jobs[agent]
+            kind, wt = j["kind"], self.wt(agent)
+            if kind in ("developer", "designer"):
+                # keep the teammate's unsaved work; the kit scripts the lead refreshed are not part of it
+                sh(["git", "add", "-A", "--", ".", ":(exclude).sdlc/bin"], wt)
+                if sh(["git", "diff", "--cached", "--quiet"], wt).returncode:
+                    sh(["git", "-c", f"user.name={agent}", "-c", "user.email=agents@sdlc.local", "commit", "-qm",
+                        f"{j['keys'][0]}: uncommitted work from {agent}"], wt)
+            for k in j["keys"]:
+                t = self.b.item(k)
+                if not t:
+                    continue
+                if kind in ("developer", "designer") and t["status"] == "in_progress":
+                    n = self.attempts[k] = self.attempts.get(k, 0) + 1
+                    if n >= self.t["max_dev_attempts"] + 1:
+                        self.escalate(t, f"{agent} returned {n} times without finishing it")
+                    else:
+                        self.b.event(k, "lead", "system", f"{agent} stopped before finishing — it continues next")
+                elif kind == "qa":
+                    if t["status"] == "in_qa" and not (t.get("qa_by") or "").startswith(("pass:", "fail:")):
+                        n = self.attempts[f"qa:{k}"] = self.attempts.get(f"qa:{k}", 0) + 1
+                        if n >= 3:
+                            self.escalate(t, "QA could not reach a verdict")
+                        else:
+                            self.b.update(k, "lead", qa_by=None)
+                    if (t.get("qa_rounds") or 0) >= self.t["max_qa_rounds"] and t["status"] == "in_progress":
+                        self.escalate(t, f"failed QA {t['qa_rounds']} times")
+                elif kind == "helper" and t["status"] == "blocked":
+                    if self.help_rounds.get(k, 0) >= self.t["max_help_rounds"]:
+                        self.escalate(t, "still blocked after team help")
+                    else:
+                        self.b.update(k, "lead", note=f"{agent} answered — back to {t['assignee']}",
+                                      status="in_progress")
+            if kind == "qa":
+                kill_pid(self.apps.pop(agent, None))
+                sh(["git", "checkout", "-q", "--detach"], wt)
+            self.b.upsert_agent(agent, status="idle", item_key=None, activity=f"finished {kind} {', '.join(j['keys'])}")
+
+    # ---------------------------------------------------------------- 2. design
+    def design_step(self) -> None:
+        for d in self.b.items(type_="design"):
+            if d["key"] in self.escalated or d["key"] in self.running_keys():
+                continue
+            if d["status"] in ("todo", "in_progress") and not self.busy("designer"):
+                if (d.get("qa_rounds") or 0) > self.d.get("max_rounds", 3):
+                    self.escalate(d, f"design sent back {d['qa_rounds']} times")
+                    continue
+                self.assign_design(d)
+            elif d["status"] == "review" and (d.get("qa_by") or "").startswith("approved:"):
+                self.merge_branch(d["branch"], [d])
+            elif d["status"] == "review" and (self.d.get("approval") == "auto" or self.a.auto_approve_design):
+                self.b.approve_design(d["key"], "auto-approved (team.design.approval = auto)", actor="lead")
+                self.merge_branch(d["branch"], [self.b.item(d["key"])])
+
+    def assign_design(self, d: dict) -> None:
+        wt, branch = self.wt("designer"), d.get("branch") or f"{self.integration}--{d['key']}"
+        if d.get("branch"):
+            r = sh(["git", "checkout", "-q", branch], wt)
+        else:
+            sh("git reset -q --hard && git clean -qfd", wt)
+            r = sh(["git", "checkout", "-q", "-B", branch, self.integration], wt)
+        if r.returncode:
+            self.escalate(d, f"could not check out {branch} for the designer: {r.stderr.strip()[:200]}")
+            return
+        mode = self.design.get("mode", "greenfield")
+        rules, steps = DESIGN_MODES[mode]
+        ui = [self.b.item(k) for k in self.design.get("ui_tasks", [])]
+        ui_text = "\n".join(f"- {t['key']} {t['title']}: " + "; ".join(t["acceptance"]) for t in ui if t) or "- (all UI)"
+        changes = [e["text"][9:] for e in self.b.events(item_key=d["key"], limit=80)
+                   if e["kind"] == "design" and e["text"].startswith("CHANGES:")]
+        feedback = (f"\nTHE HUMAN ASKED FOR CHANGES (round {len(changes)}): {changes[-1]}\n"
+                    "Update the design (keep what they did not mention), then design-ready again.\n") if changes else ""
+        if not changes and (self.attempts.get(d["key"]) or self.has_work({**d, "status": "in_progress"}, wt)):
+            feedback += ("\nYOUR EARLIER WORK IS IN THIS WORKTREE (DESIGN.md, the mockup, the notes): finish only what is "
+                         "missing, then commit and run design-ready right away.\n")
+        epic = self.b.item(d["parent_key"]) or {}
+        body = DESIGN_PROMPT.format(
+            epic_title=epic.get("title", ""), mode=mode, evidence=self.design.get("evidence", ""), mode_rules=rules,
+            impeccable_steps=steps, wt=wt, branch=branch, rel=self.rel, ui_tasks=ui_text, key=d["key"], cli=BOARD_CLI,
+            mockup_url=self.mockup_url("designer"), feedback=feedback,
+            budget=max(10, int(self.t["run_timeout_minutes"] * 0.6)),
+            critique="; if the impeccable skill is loaded, run its critique and audit on the mockup and fix the findings")
+        self.b.update(d["key"], "lead", status="in_progress", branch=branch)
+        self.assign("designer", "designer", "designer", [d["key"]], d["title"], body, wt)
+
+    # ---------------------------------------------------------------- 3. merge
+    def branch_groups(self, status: str) -> dict:
+        groups: dict = {}
+        for t in self.tasks():
+            if t["status"] == status and t.get("branch") and t["key"] not in self.escalated:
+                groups.setdefault(t["branch"], []).append(t)
+        return groups
+
+    def complete(self, branch: str) -> bool:
+        """Every task on the branch has been handed over (none still being built)."""
+        return all(t["status"] in ("in_qa", "done") for t in self.tasks() if t.get("branch") == branch
+                   and t["key"] not in self.escalated)
+
+    def merge_step(self) -> None:
+        for branch, ts in self.branch_groups("in_qa").items():
+            keys = {t["key"] for t in ts}
+            deps_merged = all((self.b.item(d) or {}).get("status") == "done"
+                              for t in ts for d in t["depends_on"] if d not in keys)
+            if self.complete(branch) and deps_merged and all((t.get("qa_by") or "").startswith("pass:") for t in ts) \
+                    and not (keys & self.running_keys()):
+                self.merge_branch(branch, ts)
+
+    def merge_branch(self, branch: str, ts: list) -> None:
+        iwt = self.wt("integration")
+        keys = ", ".join(t["key"] for t in ts)
+        r = sh(["git", "-c", "user.name=team-lead", "-c", "user.email=lead@sdlc.local", "merge", "--no-ff", "-q",
+                "-m", f"{keys}: {ts[0]['title']}" + (f" (+{len(ts) - 1})" if len(ts) > 1 else ""), branch], iwt)
+        for t in ts if not r.returncode else []:  # QA's added tests
+            qa = f"qa/{t['key']}"
+            if git(self.root, "rev-parse", "--verify", "--quiet", qa):
+                r = sh(["git", "-c", "user.name=team-lead", "-c", "user.email=lead@sdlc.local", "merge", "--no-ff",
+                        "-q", "-m", f"{t['key']}: QA tests", qa], iwt)
+                if r.returncode:
+                    break
+        if r.returncode:
+            sh(["git", "merge", "--abort"], iwt)
+            n = self.attempts[f"merge:{branch}"] = self.attempts.get(f"merge:{branch}", 0) + 1
+            if n >= 3:
+                for t in ts:
+                    self.escalate(t, f"merge into {self.integration} failed {n} times")
+                return
+            for t in ts:
+                self.b.set_meta(**{f"conflict:{t['key']}": True})
+                self.b.update(t["key"], "lead", note=f"merge conflict with {self.integration}", status="in_progress")
+            log(f"merge conflict on {branch} → back to {ts[0].get('assignee')}")
+            return
+        for t in ts:
+            self.b.update(t["key"], "lead", note=f"merged into {self.integration}", status="done")
+            self.b.event(t["key"], "lead", "merge", f"merged {branch} into {self.integration}")
+            self.b.set_meta(**{f"conflict:{t['key']}": False})
+        log(f"merged {keys} into {self.integration}")
+        self.warm(self.devs + self.qas)
+
+    # ---------------------------------------------------------------- 4. lead checks for setup-only work
+    def check_step(self) -> None:
+        for branch, ts in self.branch_groups("in_qa").items():
+            if not self.complete(branch) or any(t.get("qa_by") for t in ts) or not all(t["key"] in self.no_qa for t in ts):
+                continue
+            wt = self.wt("check")
+            sh(["git", "checkout", "-q", "--detach", branch], wt)
+            self.fresh_bin(wt)
+            ok, out = True, "no verify commands configured"
+            if not self.a.simulate and any((self.cfg.get("verify") or {}).values()):
+                r = sh([sys.executable, ".sdlc/bin/sdlc.py", "verify"], wt, timeout=1800,
+                       env={**os.environ, "PYTHONIOENCODING": "utf-8"})
+                ok, out = r.returncode == 0, (r.stdout + r.stderr).strip()[-600:]
+            for t in ts:
+                if ok:
+                    self.b.event(t["key"], "lead", "qa", "PASS: setup task — verify green (checked by the lead)")
+                    self.b.update(t["key"], "lead", qa_by="pass:lead")
+                else:
+                    self.b.event(t["key"], "lead", "qa", f"FAIL: verify is not green: {out}")
+                    self.b.update(t["key"], "lead", status="in_progress", qa_by="fail:lead",
+                                  qa_rounds=(t.get("qa_rounds") or 0) + 1)
+            if ok:
+                self.merge_step()
+
+    # ---------------------------------------------------------------- 5. QA per story
+    def qa_step(self) -> None:
+        for branch, ts in self.branch_groups("in_qa").items():
+            todo = [t for t in ts if not t.get("qa_by")]
+            if not todo or not self.complete(branch) or any(t["key"] in self.running_keys() for t in ts):
+                continue
+            free = [q for q in self.qas if not self.busy(q)]
+            if not free:
+                return
+            self.assign_qa(free[0], branch, todo)
+        # QA would sit idle while a developer is still on the rest of its story: test what was handed in already
+        # (on its own qa/ branch). The branch still merges only when every task on it has passed.
+        for branch, ts in self.branch_groups("in_qa").items():
+            testing = {k for j in self.jobs.values() if j["kind"] != "developer" for k in j["keys"]}
+            todo = [t for t in ts if not t.get("qa_by") and t["key"] not in testing]  # handed in, even mid-batch
+            free = [q for q in self.qas if not self.busy(q)]
+            if not free:
+                return
+            if todo and not self.complete(branch):
+                self.assign_qa(free[0], branch, todo)
+
+    def start_app_detached(self, agent: str, wt: Path, port: int) -> str | None:
+        cmd = (self.t["qa"].get("start_cmd") or "").strip()
+        if not cmd or self.a.simulate:
+            return None
+        if self.cfg["verify"].get("setup"):
+            sh([sys.executable, ".sdlc/bin/sdlc.py", "verify", "setup"], wt, timeout=1800,
+               env={**os.environ, "SDLC_SETUP_IF_CHANGED": "1", "PYTHONIOENCODING": "utf-8"})
+        for cand in [port + 10 * i for i in range(10)]:
+            if port_free(cand):
+                port = cand
+                break
+        kw = dict(NEW_GROUP)
+        if os.name == "nt":
+            kw["creationflags"] = kw.get("creationflags", 0) | 0x00000008  # DETACHED_PROCESS: outlive this call
+        (Path(self.b.path).parent / "logs").mkdir(parents=True, exist_ok=True)
+        logf = open(Path(self.b.path).parent / "logs" / f"app-{agent}.log", "w", encoding="utf-8", errors="replace")
+        proc = subprocess.Popen(portable_cmd(cmd).replace("{port}", str(port)), shell=True, cwd=wt, stdout=logf,
+                                stderr=subprocess.STDOUT, stdin=subprocess.DEVNULL,
+                                env={**os.environ, "PORT": str(port)}, **kw)
+        self.apps[agent] = proc.pid
+        url = f"http://127.0.0.1:{port}"
+        deadline = time.time() + self.t["qa"].get("start_timeout", 60)
+        while time.time() < deadline:
+            if proc.poll() is not None:
+                return url + f" (the app exited at startup — see {logf.name}; report that in your verdicts)"
+            try:
+                urllib.request.urlopen(url + self.t["qa"].get("health_path", "/"), timeout=2)
+                return url
+            except urllib.error.HTTPError:
+                return url
+            except Exception:
+                time.sleep(1)
+        return url + " (it did not answer the health check yet — retry, and report it if it stays down)"
+
+    def assign_qa(self, agent: str, branch: str, ts: list) -> None:
+        wt, qa_branch = self.wt(agent), f"qa/{ts[0]['key']}"
+        for t in ts:
+            self.b.update(t["key"], "lead", qa_by=agent)
+        sh("git reset -q --hard && git clean -qfd", wt)
+        r = sh(["git", "checkout", "-q", "-B", qa_branch, branch], wt)
+        if r.returncode:
+            for t in ts:
+                self.escalate(t, f"QA could not check out {branch}: {r.stderr.strip()[:200]}")
+            return
+        self.fresh_bin(wt)
+        port = self.t["qa"]["port_base"] + self.qas.index(agent)
+        app = self.start_app_detached(agent, wt, port)
+        story = self.b.item(ts[0]["parent_key"]) or {}
+        browser = (" with the browser tools (mcp__playwright__*: navigate, snapshot, click, type, screenshot)"
+                   if self.t["qa"].get("browser") == "playwright-mcp" else " with Playwright (npx playwright / python)")
+        design = (DESIGN_FOR_QA.format(mockup_url=self.mockup_url())
+                  if self.design and any(self.design["key"] in t["depends_on"] for t in ts) else "")
+        body = TL_QA.format(story_key=story.get("key"), story_title=story.get("title"), branch=qa_branch,
+                            dev=ts[0].get("assignee"), tasks=self.tasks_text(ts), py=PY, cli=BOARD_CLI,
+                            app=(f"The lead started the app for you at {app}. Stop nothing; the lead stops it."
+                                 if app else "No app server is configured (team.qa.start_cmd): test through the "
+                                             "test suite and API calls."),
+                            browser=browser, design=design,
+                            budget=max(5, int(self.t["qa"].get("minutes_per_task", 4)) * len(ts)))
+        self.assign(agent, "qa", "qa", [t["key"] for t in ts], f"QA {story.get('key')}: {story.get('title')}", body, wt)
+
+    # ---------------------------------------------------------------- 6. help
+    def help_step(self) -> None:
+        for t in self.tasks():
+            if t["status"] != "blocked" or t["key"] in self.escalated or t["key"] in self.running_keys():
+                continue
+            helpers = [n for n in self.devs if not self.busy(n) and n != t["assignee"]] or \
+                      [n for n in self.qas if not self.busy(n)]
+            if not helpers:
+                if len(self.devs) == 1 and not self.qas:
+                    self.escalate(t, "no teammate available to help")
+                continue
+            agent = helpers[0]
+            reason = next((e["text"].split(": ", 1)[-1] for e in reversed(self.b.events(item_key=t["key"], limit=50))
+                           if e["kind"] == "status" and "Blocked" in e["text"]), "see the task history")
+            self.help_rounds[t["key"]] = self.help_rounds.get(t["key"], 0) + 1
+            ctx = {**self.context(t), "agent": agent, "dev": t["assignee"], "wt": self.wt(t["assignee"]),
+                   "reason": reason}
+            body = HELP_PROMPT.format(**ctx).replace("Then stop.", "")
+            self.assign(agent, "developer" if agent in self.devs else "qa", "helper", [t["key"]],
+                        f"help {t['assignee']} on {t['key']}", body, self.wt(agent))
+
+    # ---------------------------------------------------------------- 7. developers, one story batch at a time
+    def pick_batch(self, dev: str) -> list:
+        busy_keys = self.running_keys()
+        open_ts = [t for t in self.tasks() if t["key"] not in self.escalated and t["key"] not in busy_keys]
+        back = [t for t in open_ts if t["status"] == "in_progress" and t.get("branch") and t["assignee"] == dev]
+        if back:
+            b = back[0]["branch"]
+            return [t for t in open_ts if t["status"] == "in_progress" and t.get("branch") == b]
+        done = {t["key"] for t in self.tasks() if t["status"] == "done"} | \
+               {d["key"] for d in self.b.items(type_="design") if d["status"] == "done"}
+        if self.t.get("optimistic", True):
+            # optimistic start: build on work that is already handed over (in QA) instead of idling until it merges;
+            # nothing merges before its dependencies passed QA, and designs still need the human's approval
+            done |= {t["key"] for t in self.tasks() if t["status"] == "in_qa" and t.get("branch")
+                     and t["key"] not in self.escalated and t["key"] not in self.no_base}
+        ready = [t for t in open_ts if t["status"] == "todo" and set(t["depends_on"]) <= done and not self.file_clash(t)]
+        if not ready:
+            return []
+        mine = [t for t in ready if t["assignee"] == dev]
+        first = (mine or ready)[0]
+        batch, keys = [first], {first["key"]}
+        for t in [x for x in open_ts if x["status"] == "todo" and x["parent_key"] == first["parent_key"]]:
+            if len(batch) >= self.batch_max:
+                break
+            if t["key"] not in keys and set(t["depends_on"]) <= done | keys and not self.file_clash(t):
+                batch.append(t)
+                keys.add(t["key"])
+        return sorted(batch, key=lambda t: int(re.sub(r"\D", "", t["key"]) or 0))
+
+    def dev_step(self) -> None:
+        for dev in self.devs:
+            if self.busy(dev):
+                continue
+            batch = self.pick_batch(dev) or self.rebalance(dev)
+            if batch:
+                self.assign_dev(dev, batch)
+
+    # ---------------------------------------------------------------- rebalancing, like a real team lead
+    def started(self, agent: str, t: dict) -> bool:
+        """Has this developer begun the task? A commit for it, or any of its planned files changed."""
+        wt = self.wt(agent)
+        subjects = sh(["git", "log", "--format=%s", f"{self.integration}..HEAD"], wt).stdout.splitlines()
+        if any(x.startswith(t["key"] + ":") for x in subjects):
+            return True
+        changed = set(sh(["git", "diff", "--name-only", f"{self.integration}...HEAD"], wt).stdout.split())
+        changed |= {ln[3:].strip().strip('"').replace("\\", "/")
+                    for ln in sh(["git", "status", "--porcelain", "-uall"], wt).stdout.splitlines()}
+        planned = {f.replace("\\", "/").rstrip("/") for f in t.get("files") or []}
+        return any(c in planned or any(c.startswith(f + "/") for f in planned) for c in changed)
+
+    def rebalance(self, idle: str) -> list:
+        """An idle developer takes tasks another developer was given but has not started — only work that does not
+        depend on anything that developer is still building. The busy developer is told to skip them."""
+        done = {t["key"] for t in self.tasks() if t["status"] in ("done", "in_qa")} | \
+               {d["key"] for d in self.b.items(type_="design") if d["status"] == "done"}
+        for agent, j in list(self.jobs.items()):
+            if j["kind"] != "developer" or agent == idle or len(j["keys"]) < 2:
+                continue
+            ts = [t for t in (self.b.item(k) for k in j["keys"]) if t and t["status"] == "in_progress"]
+            keep = {t["key"] for t in ts if self.started(agent, t)} or ({ts[0]["key"]} if ts else set())
+            # (nothing begun yet → it is on the first one; the rest can still go to the idle developer)
+            move = []
+            for t in ts:
+                if t["key"] in keep:
+                    continue
+                inside = set(t["depends_on"]) & set(j["keys"])
+                if inside and inside <= keep:
+                    keep.add(t["key"])  # continues what it is already building: stays, keeps the context
+                else:
+                    move.append(t)
+            takeable = [t for t in move if set(t["depends_on"]) <= done | {m["key"] for m in move}
+                        and not (set(t["depends_on"]) & keep)]
+            if not takeable:
+                continue
+            for t in move:
+                self.b.update(t["key"], "lead", status="todo", assignee=idle if t in takeable else t["assignee"],
+                              branch=None, note=f"moved from {agent} (not started)")
+                self.b.event(t["key"], "lead", "assign", f"moved from {agent} to {idle}: {agent} had not started it")
+            j["keys"] = [k for k in j["keys"] if k in keep]
+            cli = f"{BOARD_CLI} --as {agent} --role developer"
+            note = (f"UPDATE from the team lead: {', '.join(t['key'] for t in move)} moved to "
+                    f"{idle if takeable else 'later'} because you had not started them. Do NOT build them. Finish only "
+                    f"{', '.join(j['keys'])}, submit with {cli} submit <key> \"...\", then message the lead: "
+                    f"done {', '.join(j['keys'])}.")
+            f = self.adir / f"{agent}-update-{int(time.time())}.md"
+            f.write_text(note + "\n", encoding="utf-8")
+            self.assignments.append({"agent": agent, "action": "send", "agent_type": TL_ROLES["developer"],
+                                     "model": self.t["models"].get("developer", "sonnet"), "keys": j["keys"],
+                                     "title": "scope change", "file": str(f), "message": note})
+            log(f"rebalanced: {', '.join(t['key'] for t in move)} from {agent} → {idle}")
+            return [t for t in (self.b.item(m["key"]) for m in takeable) if t]
+        return []
+
+    def assign_dev(self, dev: str, batch: list) -> None:
+        wt = self.wt(dev)
+        returning = batch[0]["status"] == "in_progress" and batch[0].get("branch")
+        branch = batch[0].get("branch") if returning else f"{self.integration}--{batch[0]['key']}"
+        if returning:
+            r = sh(["git", "checkout", "-q", branch], wt)
+            for t in batch:
+                if git(self.root, "rev-parse", "--verify", "--quiet", f"qa/{t['key']}"):
+                    sh(["git", "merge", "-q", "--no-edit", f"qa/{t['key']}"], wt)
+        else:
+            sh("git reset -q --hard && git clean -qfd", wt)
+            r = sh(["git", "checkout", "-q", "-B", branch, self.integration], wt)
+            bases = sorted({d for t in batch for d in t["depends_on"]
+                            if (self.b.item(d) or {}).get("status") == "in_qa"} - {t["key"] for t in batch})
+            for d in bases:  # optimistic start: bring in the handed-over work this batch builds on
+                dep = self.b.item(d)
+                m = sh(["git", "-c", "user.name=team-lead", "-c", "user.email=lead@sdlc.local", "merge", "-q",
+                        "--no-edit", dep["branch"]], wt)
+                if m.returncode:
+                    sh(["git", "merge", "--abort"], wt)
+                    sh(["git", "checkout", "-q", "-B", branch, self.integration], wt)
+                    self.no_base.add(d)
+                    self.save()
+                    log(f"{', '.join(t['key'] for t in batch)}: can't build on {d} yet (conflict) — waits for its merge")
+                    return
+            if bases:
+                self.b.event(batch[0]["key"], "lead", "system", f"optimistic start on top of {', '.join(bases)} (in QA)")
+        if r.returncode:
+            for t in batch:
+                self.escalate(t, f"could not check out {branch}: {r.stderr.strip()[:200]}")
+            return
+        extra = ""
+        for t in batch:
+            fails = [e for e in self.b.events(item_key=t["key"], limit=50) if e["kind"] == "qa" and e["text"].startswith("FAIL")]
+            if t["status"] == "in_progress" and fails:
+                extra += f"\nQA SENT {t['key']} BACK: {fails[-1]['text'][6:]}\nFix it, re-run its tests, submit again.\n"
+            elif returning and (self.attempts.get(t["key"]) or self.has_work(t, wt)):
+                extra += f"\n{t['key']}: your earlier work is committed on this branch — continue it, don't start over.\n"
+            if self.b.meta().get(f"conflict:{t['key']}"):
+                extra += (f"\n{t['key']} CONFLICTS with {self.integration}: run `git merge {self.integration}`, resolve "
+                          "keeping both features, run verify, commit, submit again.\n")
+        if self.design and any(self.design["key"] in t["depends_on"] for t in batch):
+            extra += DESIGN_FOR_DEV.format(rel=self.rel, mockup_url=self.mockup_url(), key=", ".join(
+                t["key"] for t in batch), cli=BOARD_CLI)
+        story = self.b.item(batch[0]["parent_key"]) or {}
+        epic = self.b.item(story.get("parent_key") or "") or {}
+        body = TL_DEV.format(story_key=story.get("key"), story_title=story.get("title"), epic_title=epic.get("title"),
+                             branch=branch, n=len(batch), tasks=self.tasks_text(batch), extra=extra, rel=self.rel,
+                             py=PY, cli=BOARD_CLI, budget=max(10, int(self.t["run_timeout_minutes"] * 0.6)))
+        for t in batch:
+            self.b.update(t["key"], "lead", status="in_progress", assignee=dev, branch=branch)
+        self.assign(dev, "developer", "developer", [t["key"] for t in batch],
+                    f"{story.get('key')}: " + ", ".join(t["key"] for t in batch), body, wt)
+
+    # ---------------------------------------------------------------- one step
+    def setup_session(self) -> None:
+        super().setup()  # worktrees, script sync, stale QA claims, pre-warm
+        p = self.wt("check")
+        if not (p / ".git").exists():
+            sh(["git", "worktree", "add", "--detach", str(p), self.integration], self.root)
+
+    def join_warm(self) -> None:
+        """Installs started by setup or a merge run in parallel across worktrees; finish them before anyone gets
+        work there (a checkout during an install would race it)."""
+        for th in list(getattr(self, "warming", {}).values()):
+            th.join(timeout=1800)
+        self.warming = {}
+
+    def step(self) -> dict:
+        self.finish_jobs()
+        self.design_step()
+        self.merge_step()
+        self.check_step()
+        self.join_warm()
+        self.qa_step()
+        self.help_step()
+        self.dev_step()
+        self.join_warm()
+        if self.sync:
+            self.sync.run()
+        self.save()
+        ts = self.tasks()
+        human = []
+        for d in self.b.items(type_="design"):
+            if d["status"] == "review" and not (d.get("qa_by") or "").startswith("approved:"):
+                human.append({"key": d["key"], "what": "design approval", "mockup": f"{self.board_url}/design/{d['key']}",
+                              "summary": d.get("note") or ""})
+        for k in sorted(self.escalated):
+            t = self.b.item(k) or {}
+            human.append({"key": k, "what": "escalated", "why": t.get("note") or ""})
+        working = [{"agent": a, "keys": j["keys"], "kind": j["kind"],
+                    "minutes": int((time.time() - j["started"]) / 60), "budget": j.get("budget", 0)}
+                   for a, j in self.jobs.items()]
+        finished = bool(ts) and all(t["status"] == "done" or t["key"] in self.escalated for t in ts) and not self.jobs
+        if finished:
+            self.b.set_meta(status="done" if not self.escalated else "needs-human")
+        return {"assignments": self.assignments, "waiting_for_human": human, "working": working,
+                "progress": f"{sum(t['status'] == 'done' for t in ts)}/{len(ts)} tasks done",
+                "finished": finished, "board": self.board_url}
+
+
+def tl_args(a):
+    for k, v in (("developers", None), ("qa", None), ("simulate", False), ("auto_approve_design", False),
+                 ("replan", False), ("pr", False), ("done", [])):
+        if not hasattr(a, k):
+            setattr(a, k, v)
+    return a
+
+
+def cmd_prepare(root: Path, cfg: dict, a) -> None:
+    """Start (or restart) an agent-teams session: plan if needed, worktrees, installs, first assignments."""
+    os.environ["SDLC_LOG_STDERR"] = "1"
+    a = tl_args(a)
+    change = resolve_change(root, cfg, a.change)
+    with contextlib.redirect_stdout(sys.stderr):  # stdout carries only the JSON for the session lead
+        cmd_plan(root, cfg, a)
+    lead = TeamLead(root, cfg, change, a, session_start=True)
+    lead.setup_session()
+    out = lead.step()
+    out["worktrees"] = {n: str(lead.wt(n)) for n in ["integration", *lead.devs, *lead.qas, *lead.designers]}
+    out["integration_branch"] = lead.integration
+    print(json.dumps(out, indent=2))
+
+
+def cmd_next(root: Path, cfg: dict, a) -> None:
+    """One lead step: finish what teammates completed, merge, hand out the next assignments."""
+    os.environ["SDLC_LOG_STDERR"] = "1"
+    a = tl_args(a)
+    change = resolve_change(root, cfg, a.change)
+    lead = TeamLead(root, cfg, change, a)
+    out = lead.step()
+    print(json.dumps(out, indent=2))
+
+
+def cmd_wrap(root: Path, cfg: dict, a) -> None:
+    """Final integration verify + team report, once every task is done or escalated."""
+    a = tl_args(a)
+    change = resolve_change(root, cfg, a.change)
+    lead = TeamLead(root, cfg, change, a)
+    lead.running = {}
+    for agent in list(lead.apps):
+        kill_pid(lead.apps.pop(agent))
+    lead.save()
+    sys.exit(lead.wrap_up())
+
+
+
+NUDGE = ("Time check from the lead (not a stop): you are {minutes} min into a ~{budget} min assignment on {keys}. "
+         "Post one board comment with where you are and what is left. If you are fighting tooling (installs, "
+         "browser, ports, shells), stop that and {alt}. Otherwise keep going and finish properly — never skip "
+         "a check to save time.")
+
+
+def cmd_watch(root: Path, cfg: dict, a) -> None:
+    """Run in the background next to an agent-teams run. Exits (printing JSON) as soon as a teammate is past its time
+    budget, so the lead can nudge it without polling. Each assignment is reported once."""
+    stamp = root / ".sdlc" / "state" / "nudged.json"
+    deadline = time.time() + max(1, a.max_minutes) * 60
+    wt_root = root / cfg["team"].get("worktree_dir", ".sdlc/worktrees")
+    start_heads: dict = {}
+    while True:
+        try:
+            seen = json.loads(stamp.read_text(encoding="utf-8")) if stamp.exists() else {}
+        except ValueError:
+            seen = {}
+        b = Board()
+        jobs = (b.meta().get("tl") or {}).get("jobs", {})
+        # an idle developer while another developer moves on to its next task → `next` may hand over untouched work
+        heads = {ag: git(wt_root / ag, "rev-parse", "HEAD") for ag, j in jobs.items() if j.get("kind") == "developer"
+                 and len(j.get("keys", [])) > 1}
+        idle_dev = any((ag.get("role") or "") == "developer" and ag["name"] not in jobs for ag in b.agents())
+        moved = sorted(ag for ag, h in heads.items() if ag in start_heads and h != start_heads[ag])
+        start_heads.update({ag: h for ag, h in heads.items() if ag not in start_heads})
+        if idle_dev and moved:
+            print(json.dumps({"over_budget": [], "work_waiting": moved,
+                              "do": "run team.py next <change> (no --done) and relay its assignments"}, indent=2))
+            return
+        late = []
+        # handed-in work waiting while a QA teammate has nothing to do → the lead should run `next` now
+        qas = [ag["name"] for ag in b.agents() if (ag.get("role") or "") == "qa"]
+        waiting = sorted(t["key"] for t in b.items(type_="task") if t["status"] == "in_qa" and not t.get("qa_by"))
+        if waiting and any(q not in jobs for q in qas):
+            print(json.dumps({"over_budget": [], "work_waiting": waiting,
+                              "do": "run team.py next <change> (no --done) and relay its assignments"}, indent=2))
+            return
+        for agent, j in jobs.items():
+            mins = (time.time() - j.get("started", time.time())) / 60
+            budget = j.get("budget") or 0
+            if budget and mins > budget * a.grace and seen.get(agent) != j.get("started"):
+                alt = ("verify through the tests and API calls instead" if j.get("kind") == "qa"
+                       else "mark the task blocked with exactly what you need")
+                late.append({"agent": agent, "keys": j.get("keys", []), "minutes": int(mins), "budget": budget,
+                             "message": NUDGE.format(minutes=int(mins), budget=budget,
+                                                     keys=", ".join(j.get("keys", [])), alt=alt)})
+                seen[agent] = j.get("started")
+        if late or time.time() > deadline:
+            if late:
+                stamp.parent.mkdir(parents=True, exist_ok=True)
+                stamp.write_text(json.dumps(seen), encoding="utf-8")
+            print(json.dumps({"over_budget": late, "work_waiting": []}, indent=2))
+            return
+        time.sleep(max(5, a.every))
+
+
+TEAM_ALLOW = ["Bash(cd *)", "Bash(git status*)", "Bash(git diff*)", "Bash(git log*)", "Bash(git add*)",
+              "Bash(git commit*)", "Bash(git checkout*)", "Bash(git merge*)", "Bash(git show*)", "Bash(git rev-parse*)",
+              "Bash(python *)", "Bash(python3 *)", "Bash(py *)", "Bash(pytest*)", "Bash(npm *)", "Bash(npx *)",
+              "Bash(node *)", "Bash(uv *)", "Bash(pip *)", "Bash(curl *)", "Bash(ls*)", "Bash(cat *)", "Bash(head *)",
+              "Bash(tail *)", "Bash(grep *)", "Bash(mkdir *)", "Bash(echo *)", "Bash(.venv/*)", "Bash(.venv\\*)",
+              "Read", "Edit", "Write", "Glob", "Grep", "mcp__playwright"]
+TEAM_DENY = ["Bash(git push*)", "Bash(git reset --hard*)", "Bash(rm -rf *)"]
+
+
+def cmd_allow(root: Path, cfg: dict, a) -> None:
+    """Pre-approve the commands teammates need (git, python, npm, tests, edits) in .claude/settings.local.json, so they
+    don't wait on permission prompts in the lead's window. Run only after the human agreed. Push stays denied."""
+    p = root / ".claude" / "settings.local.json"
+    data = json.loads(p.read_text(encoding="utf-8")) if p.exists() else {}
+    perms = data.setdefault("permissions", {})
+    allow, deny = perms.setdefault("allow", []), perms.setdefault("deny", [])
+    added = [r for r in TEAM_ALLOW if r not in allow]
+    allow += added
+    deny += [r for r in TEAM_DENY if r not in deny]
+    p.parent.mkdir(parents=True, exist_ok=True)
+    p.write_text(json.dumps(data, indent=2) + "\n", encoding="utf-8")
+    print(f"{p}: {len(added)} rules allowed, push/reset --hard/rm -rf denied")
+
+
 def cmd_run(root: Path, cfg: dict, a) -> None:
     change = resolve_change(root, cfg, a.change)
     b = Board()
@@ -1224,6 +2203,20 @@ def main() -> None:
         s.add_argument("--replan", action="store_true")
         s.add_argument("--pr", action="store_true")
         s.add_argument("--auto-approve-design", action="store_true", help="skip the human design gate (demos only)")
+    for name in ("prepare", "next", "wrap"):  # Claude Code agent-teams mode (the session is the lead)
+        s = sub.add_parser(name)
+        s.add_argument("change")
+        s.add_argument("--developers", type=int)
+        s.add_argument("--qa", type=int)
+        s.add_argument("--done", nargs="*", default=[], help="teammates that reported done (or stopped)")
+        s.add_argument("--simulate", action="store_true")
+        s.add_argument("--auto-approve-design", action="store_true")
+    s = sub.add_parser("watch")
+    s.add_argument("change", nargs="?")
+    s.add_argument("--grace", type=float, default=1.0, help="report at budget × grace")
+    s.add_argument("--every", type=int, default=30, help="seconds between checks")
+    s.add_argument("--max-minutes", type=int, default=30, help="exit with an empty list after this long")
+    sub.add_parser("allow")
     sub.add_parser("status")
     s = sub.add_parser("reset"); s.add_argument("--yes", action="store_true")
     a = ap.parse_args()
@@ -1231,7 +2224,8 @@ def main() -> None:
     if not root:
         sys.exit("not an SDLC repo: run /sdlc:init first")
     cfg = load_config(root)
-    {"plan": cmd_plan, "run": cmd_run, "status": cmd_status, "reset": cmd_reset}[a.cmd](root, cfg, a)
+    {"plan": cmd_plan, "run": cmd_run, "status": cmd_status, "reset": cmd_reset, "prepare": cmd_prepare,
+     "next": cmd_next, "wrap": cmd_wrap, "allow": cmd_allow, "watch": cmd_watch}[a.cmd](root, cfg, a)
 
 
 if __name__ == "__main__":
