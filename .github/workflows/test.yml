@@ -1,0 +1,37 @@
+name: test
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  test:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest, macos-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+      - name: git identity
+        run: |
+          git config --global user.email "ci@example.com"
+          git config --global user.name "ci"
+          git config --global init.defaultBranch main
+      - name: config commands work on this OS (real npm + venv)
+        run: python tests/test_portable.py
+      - name: agent-team lead (scripted teammates, design gate, QA fail, restart)
+        run: python tests/test_teamlead.py
+      - name: rebalancing (an idle developer takes untouched work)
+        run: python tests/test_rebalance.py
+      - name: early QA (QA tests handed-in tasks while the developer finishes the story)
+        run: python tests/test_early_qa.py
+      - name: Jira / Linear sync
+        run: python tests/test_trackers.py
