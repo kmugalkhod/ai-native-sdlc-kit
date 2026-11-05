@@ -14,7 +14,7 @@ Idea: `$ARGUMENTS`
 You run every stage yourself in this session. The user should never need a terminal, sed, or manual commits. Their job is to answer questions and click the gates.
 
 **Stage instructions live in the other skills. Read each one when you reach its stage and follow it, with the overrides below.**
-`${CLAUDE_PLUGIN_ROOT}/skills/<stage>/SKILL.md` for init, intent, spec, plan, build, review.
+`${CLAUDE_PLUGIN_ROOT}/skills/<stage>/SKILL.md` for init, intent, spec, architect, plan, build, review.
 
 **Gate rule.** At each gate use AskUserQuestion with one question and these options:
 - **Accept (Recommended)**
@@ -23,9 +23,9 @@ You run every stage yourself in this session. The user should never need a termi
 
 Put a 3–6 line summary of the artifact in the question text, not the whole file. On *Change something*, ask what to change, apply it, and ask the gate again. On *Stop here*, commit what exists and tell the user to re-run `/sdlc:loop` on the same idea to resume.
 
-**`--auto`.** Skip the spec, plan and review gates: the `sdlc:gatekeeper` agent decides instead, and its verdict is shown in one line. The intent gate always stays with the user, as does any spec concern marked `- [ ]`.
+**`--auto`.** Skip the spec, plan and review gates: the `sdlc:gatekeeper` agent decides instead, and its verdict is shown in one line. The intent gate and the architecture gate always stay with the user, as does any spec concern marked `- [ ]`.
 
-Keep a task list (TaskCreate/TaskUpdate) with these items: Setup · Intent · Spec · Plan · Build & test · Review · Done. Tick each one off as it finishes. Between stages, say one short line about what you're starting. No long narration.
+Keep a task list (TaskCreate/TaskUpdate) with these items: Setup · Intent · Spec · Architecture · Plan · Build & test · Review · Done. Tick each one off as it finishes. Between stages, say one short line about what you're starting. No long narration.
 
 ---
 
@@ -48,6 +48,14 @@ Keep a task list (TaskCreate/TaskUpdate) with these items: Setup · Intent · Sp
 - Follow the **spec** skill.
 - Resolve every `- [ ]` concern with the user, one AskUserQuestion per concern (options: the candidate decisions). Record each as `- [x] … — decided by <user>`.
 - **Gate:** "Accept this spec?" On Accept: set `Status: accepted` and commit `spec: <slug>`.
+
+## 2b. Architecture → gate (new projects and architectural changes only)
+Follow the **architect** skill. It runs when the repo has no `sdlc/ARCHITECTURE.md` and the change is a new product or
+a sizeable feature, or when the spec adds or changes a component, data store, queue, external service, public API,
+auth model or deployment unit. Otherwise skip it with one line: "architecture unchanged".
+- **Gate (always the user's call):** "Approve this architecture?"
+  - On Approve: set `Status: approved` and `Approved by: <git user.name>`, then commit `architecture: <slug>`.
+- The plan, the team planner and every developer build within the approved architecture.
 
 ## 3. Plan → gate
 - Follow the **plan** skill. Do not edit source files in this stage.

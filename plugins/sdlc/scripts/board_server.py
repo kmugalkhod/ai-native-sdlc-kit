@@ -176,6 +176,10 @@ select{background:var(--panel2);border:1px solid var(--line);border-radius:9px;h
 .prog-meta .ok{color:var(--green)}
 .tag{font-size:11px;height:20px;display:inline-flex;align-items:center;padding:0 7px;border-radius:6px;white-space:nowrap;max-width:140px;overflow:hidden;text-overflow:ellipsis;
   background:color-mix(in srgb,var(--sc) 14%,transparent);color:var(--sc);border:1px solid color-mix(in srgb,var(--sc) 30%,transparent)}
+.costbox{display:flex;flex-direction:column;align-items:flex-end;line-height:1.1;padding:0 6px;cursor:help}
+.costbox b{font-size:15px;font-variant-numeric:tabular-nums}
+.costbox span{font-size:10.5px;color:var(--faint);text-transform:uppercase;letter-spacing:.04em}
+.chip.cost{font-variant-numeric:tabular-nums;color:var(--text)}
 .chip{font-size:11px;height:20px;display:inline-flex;align-items:center;gap:3px;padding:0 6px;border-radius:6px;color:var(--muted);border:1px solid var(--line);white-space:nowrap}
 .chip.red{color:var(--red);border-color:color-mix(in srgb,var(--red) 40%,var(--line))}
 .chip.amber{color:var(--amber);border-color:color-mix(in srgb,var(--amber) 40%,var(--line))}
@@ -273,6 +277,7 @@ pre.desc{white-space:pre-wrap;margin:0;font:inherit;color:var(--muted)}
     <span class="pill alert" id="needs" hidden></span>
   </div>
   <div class="grow"></div>
+  <div class="costbox" id="costTotal" hidden></div>
   <div class="prog" title="Tasks done"><div class="bar"><i id="progbar" style="width:0"></i></div><b id="progtxt">0/0</b></div>
   <label class="search"><svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" aria-hidden="true"><circle cx="11" cy="11" r="7"/><path d="m20 20-3.5-3.5"/></svg>
     <input id="q" placeholder="Search tasks, stories, agents…" aria-label="Search"><kbd>/</kbd></label>
@@ -323,7 +328,7 @@ const COLS=[["todo","To Do","var(--muted)"],["in_progress","In Progress","var(--
 const LABEL=Object.assign(Object.fromEntries(COLS.map(c=>[c[0],c[1]])),{in_qa:"In QA",review:"Needs approval"});
 const COLOF=st=>st==="review"?"in_qa":st;
 const STORY_COLORS=["var(--violet)","var(--teal)","var(--amber)","var(--blue)","var(--pink)","var(--green)","var(--red)"];
-let S={items:[],agents:[],events:[],messages:[],meta:{},progress:{},live:{},now:0},since=0,view="board",openKey=null,fstory="",lastSig="";
+let S={items:[],agents:[],events:[],messages:[],meta:{},progress:{},live:{},cost:{},now:0},since=0,view="board",openKey=null,fstory="",lastSig="";
 const closedEpics=new Set(),closedGroups=new Set();
 const $=id=>document.getElementById(id);
 const esc=s=>String(s??"").replace(/[&<>"']/g,c=>({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;","'":"&#39;"}[c]));
@@ -345,6 +350,9 @@ const BUSY=["working","helping","designing"];
 function curKey(a){const j=((S.meta.tl||{}).jobs||{})[a.name];if(!j||!(j.keys||[]).length)return a.item_key;
   if(j.kind!=="developer")return j.keys[0];
   return j.keys.find(k=>(S.items.find(i=>i.key===k)||{}).status==="in_progress")||j.keys[j.keys.length-1]}
+function agentCost(a){const lc=(S.cost||{}).agents||{};const v=lc[a.name]!=null?lc[a.name]:a.cost;
+  return v?`${a.runs?a.runs+" runs<br>":""}$${v.toFixed(2)}`:""}
+function cardCost(t){const v=((S.cost||{}).tasks||{})[t.key];return v>=0.005?`<span class="chip cost" title="API-equivalent cost of the work on this card so far">$${v.toFixed(2)}</span>`:""}
 function liveOn(t){const key=t.key,jobs=(S.meta.tl||{}).jobs;
   if(jobs){for(const [name,j] of Object.entries(jobs)){if(!(j.keys||[]).includes(key))continue;
       const a=S.agents.find(x=>x.name===name)||{name,status:"working",activity:""};
@@ -377,8 +385,12 @@ function keepScroll(fn){const ids=["nav","list","team","feed"];const pos={};
 /* header + banner */
 function renderHeader(){const m=S.meta,ts=items("task"),d=ts.filter(t=>t.status==="done").length;
   $("title").textContent=m.project?`${m.project} · team board`:"Team Board";
-  const cost=S.agents.reduce((s,a)=>s+(a.cost||0),0);
-  $("subtitle").textContent=(m.change||"no change loaded")+(cost?` · $${cost.toFixed(2)} est.`:"");
+  const lc=S.cost||{},cost=lc.total||S.agents.reduce((s,a)=>s+(a.cost||0),0);
+  $("subtitle").textContent=(m.change||"no change loaded")+(cost?` · $${cost.toFixed(2)} API-equivalent`:"");
+  $("subtitle").title=cost?`What this run would cost on the Claude API (on a subscription you pay the plan).\n`+
+    Object.entries(lc.agents||{}).sort((a,b)=>b[1]-a[1]).map(([k,v])=>`${k}: $${v.toFixed(2)}`).join("\n")+
+    (lc.calls?`\n${lc.calls} model calls · ${Math.round(100*(lc.cache_share||0))}% from cache`:""):"";
+  const ct=$("costTotal");if(ct){ct.hidden=!cost;ct.innerHTML=`<b>$${(cost||0).toFixed(2)}</b><span>total cost</span>`;ct.title=$("subtitle").title}
   $("runstate").textContent=m.status||"idle";$("rundot").className="dot "+(m.status||"");
   $("tracker").textContent=m.tracker||"internal";$("branch").textContent=m.integration_branch||"—";
   $("progtxt").textContent=`${d}/${ts.length}`;$("progbar").style.width=(ts.length?100*d/ts.length:0)+"%";
@@ -445,6 +457,7 @@ function card(t){const live=liveOn(t);
      ${qaName&&t.status!=="todo"&&!qaName.startsWith("approved")?`<span class="av mini qa" title="QA ${esc(qaName)}">${ini(qaName)}</span>`:""}
      ${t.qa_rounds?`<span class="chip red" title="sent back by QA">↺ ${t.qa_rounds}</span>`:""}
      ${escd?`<span class="chip red" title="escalated to you">⚑ needs you</span>`:""}
+     ${cardCost(t)}
      ${waiting.length&&t.status==="todo"?`<span class="chip amber" title="waiting on">🔒 ${esc(waiting.join(", "))}</span>`:""}
    </div>
    ${progressBlock(t)}
@@ -492,7 +505,7 @@ function renderTeam(){const ag=S.agents.filter(a=>a.role!=="planner"||a.status==
      <div class="act" title="${esc(a.activity)}">${["working","helping","designing"].includes(a.status)?
         `${t?`<a href="#" data-key="${esc(t.key)}" class="mono">${esc(t.key)}</a> `:""}${esc(liveText(a,ck))}`:
         `<span class="sub">idle</span>${a.activity?` · ${esc(a.activity)}`:""}`}</div></div>
-     <div class="cost">${a.runs||a.cost?`${a.runs||0} runs<br>$${(a.cost||0).toFixed(2)}`:""}</div></div>`}).join("")||`<div class="empty">No agents yet</div>`;
+     <div class="cost">${agentCost(a)}</div></div>`}).join("")||`<div class="empty">No agents yet</div>`;
   const opts=["all","developer","qa",...S.agents.map(a=>a.name)];const cur=$("to").value;
   $("to").innerHTML=opts.map(o=>`<option value="${esc(o)}">@${esc(o)}</option>`).join("");$("to").value=opts.includes(cur)?cur:"all";
   const fw=$("fwho").value;$("fwho").innerHTML=`<option value="">Everyone</option>`+S.agents.filter(a=>a.role!=="planner").map(a=>`<option>${esc(a.name)}</option>`).join("");$("fwho").value=fw}
@@ -535,9 +548,9 @@ function detail(key){const t=S.items.find(i=>i.key===key);if(!t)return;openKey=k
 function render(){keepScroll(()=>{renderHeader();renderBanner();renderNow();renderNav();renderCrumb();renderTeam();
   view==="board"?renderBoard():renderList();renderFeed();if($("dlg").open&&openKey)detail(openKey)})}
 async function poll(){try{const r=await fetch("api/board?since="+since);const d=await r.json();
-    S.items=d.items;S.agents=d.agents;S.meta=d.meta;S.messages=d.messages;S.progress=d.progress||{};S.live=d.live||{};S.now=d.now||Date.now()/1000;
+    S.items=d.items;S.agents=d.agents;S.meta=d.meta;S.messages=d.messages;S.progress=d.progress||{};S.live=d.live||{};S.cost=d.cost||{};S.now=d.now||Date.now()/1000;
     if(d.events.length){S.events=since?S.events.concat(d.events).slice(-800):d.events;since=d.events[d.events.length-1].id}
-    const sig=JSON.stringify([d.items,d.agents,d.meta,since,d.progress,d.live]);if(sig!==lastSig){lastSig=sig;render()}
+    const sig=JSON.stringify([d.items,d.agents,d.meta,since,d.progress,d.live,d.cost]);if(sig!==lastSig){lastSig=sig;render()}
   }catch(e){$("runstate").textContent="offline";$("rundot").className="dot needs-human"}finally{setTimeout(poll,1500)}}
 
 /* events */
@@ -627,13 +640,56 @@ def live_progress(board: Board, root: Path, cfg: dict) -> dict:
                     newest, newest_file = m, c
             for t in ts:
                 planned = [f.replace("\\", "/") for f in (t.get("files") or [])]
-                done = [f for f in planned if f in changed or any(c.startswith(f.rstrip("/") + "/") for c in changed)]
+                hit = lambda f: f in changed or any(c.startswith(f.rstrip("/") + "/") for c in changed)
+                done = [f for f in planned if hit(f)]
+                committed = any(sub.startswith(t["key"] + ":") for sub in subjects)
+                others = {f.replace("\\", "/") for o in ts if o is not t for f in (o.get("files") or [])}
+                if not committed and not any(hit(f) for f in planned if f not in others):
+                    done = []  # only files another task of this developer also changes: not started yet
                 out[t["key"]] = {"files_done": len(done), "files_total": len(planned), "changed": len(changed),
-                                 "committed": any(sub.startswith(t["key"] + ":") for sub in subjects),
+                                 "committed": committed,
                                  "last_change": newest, "last_file": newest_file}
     except Exception:
         pass
     _PROGRESS.update(at=time.time(), data=out)
+    return out
+
+
+_COST = {"at": 0.0, "data": {}}
+
+
+def live_cost(board: Board, root: Path) -> dict:
+    """API-equivalent cost of this run, read from Claude Code's session records (also on a subscription): the total,
+    per teammate, per model and per card (each call split over the cards its agent was assigned at that moment)."""
+    if time.time() - _COST["at"] < 15:
+        return _COST["data"]
+    out: dict = {}
+    try:
+        import cost_report
+        from datetime import datetime
+        created = board.meta().get("created_at") or ""
+        try:
+            since = datetime.strptime(created, "%Y-%m-%dT%H:%M:%SZ").replace(
+                tzinfo=__import__("datetime").timezone.utc).timestamp() - 3600  # the planning before the board, too
+        except ValueError:
+            since = time.time() - 24 * 3600
+        calls = cost_report.collect(root, since)
+        with board.conn() as c:
+            rows = c.execute("SELECT ts, text FROM events WHERE kind='assign' AND actor='lead' ORDER BY id").fetchall()
+        assigns = []
+        for r in rows:
+            m = re.match(r"^(\S+) ← \S+ (.+)$", r["text"] or "")
+            if m:
+                try:
+                    ts = datetime.strptime(r["ts"], "%Y-%m-%dT%H:%M:%SZ").replace(
+                        tzinfo=__import__("datetime").timezone.utc).timestamp()
+                except ValueError:
+                    continue
+                assigns.append((ts, m.group(1), [k.strip() for k in m.group(2).split(",") if k.strip()]))
+        out = {**cost_report.summary(calls), "tasks": cost_report.by_task(calls, assigns)}
+    except Exception as e:  # cost is a convenience: never break the board
+        out = {"error": str(e)[:200]}
+    _COST.update(at=time.time(), data=out)
     return out
 
 
@@ -740,6 +796,16 @@ def live_activity(root: Path) -> dict:
     return out
 
 
+class QuietServer(ThreadingHTTPServer):
+    """A browser that refreshes or closes the tab mid-poll drops the connection; that is normal, not an error."""
+    daemon_threads = True
+
+    def handle_error(self, request, client_address):
+        if isinstance(sys.exc_info()[1], (ConnectionError, TimeoutError)):  # aborted / reset / broken pipe
+            return
+        super().handle_error(request, client_address)
+
+
 class Handler(BaseHTTPRequestHandler):
     board: Board = None  # set in main
     root: Path = None
@@ -797,6 +863,7 @@ class Handler(BaseHTTPRequestHandler):
             snap = self.board.snapshot(since=since)
             snap["progress"] = live_progress(self.board, self.root, self.cfg) if self.root else {}
             snap["live"] = live_activity(self.root) if self.root else {}
+            snap["cost"] = live_cost(self.board, self.root) if self.root else {}
             snap["now"] = time.time()
             self._json(snap)
         else:
@@ -868,7 +935,7 @@ def main() -> None:
         Handler.cfg = load_config(Handler.root) if (Handler.root / ".sdlc" / "config.json").is_file() else {}
     except Exception:
         Handler.root = Handler.board.path.parent.parent.parent
-    srv = ThreadingHTTPServer((a.host, port), Handler)
+    srv = QuietServer((a.host, port), Handler)
     print(f"team board: http://{a.host}:{port}   (db {Handler.board.path})", flush=True)
     try:
         srv.serve_forever()

@@ -15,6 +15,9 @@ You run the **compliance** pass only. Read-only; never edit.
    - Tests named in plan.md exist and assert the behaviour.
    - CLAUDE.md conventions (and its "Things Claude gets wrong") are followed.
    - Flagged concerns resolved in spec.md are honoured by the code.
+   - When `sdlc/ARCHITECTURE.md` exists, the code fits it. Each component stays inside its boundary, and there is no
+     new data store, queue, external call or service the architecture lacks. Accepted ADRs in `sdlc/adr/` are
+     followed. Architecture drift is Important.
 
 Output one line per finding:
 `[compliance] <Important|Nit|Pre-existing> path:line — finding — which artifact/rule — suggested fix`

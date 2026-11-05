@@ -108,7 +108,20 @@ def main() -> None:
                     seen["qa_fail_sent"] = True
                     b(agent, "qa", "qa-fail", k, "empty url accepted · expected 400 · got 201")
                 else:
-                    b(agent, "qa", "qa-pass", k, "checked")
+                    ev = wt / ".sdlc" / "evidence" / f"{k}-api.txt"
+                    ev.parent.mkdir(parents=True, exist_ok=True)
+                    if not seen.get("no_proof_tried"):  # a PASS without proof, and with stale proof, is refused
+                        seen["no_proof_tried"] = True
+                        r1 = b(agent, "qa", "qa-pass", k, "checked")
+                        ev.write_text("old", encoding="utf-8")
+                        os.utime(ev, (1, 1))
+                        r2 = b(agent, "qa", "qa-pass", k, "checked", "--evidence", str(ev))
+                        check(r1.returncode != 0 and "proof" in (r1.stdout + r1.stderr), "PASS without evidence refused")
+                        check(r2.returncode != 0 and "before this QA check started" in (r2.stdout + r2.stderr),
+                              "PASS with stale evidence refused")
+                    ev.write_text(f"HTTP/1.1 201 Created\n{k} ok\n", encoding="utf-8")
+                    r = b(agent, "qa", "qa-pass", k, "checked", "--evidence", str(ev))
+                    check(r.returncode == 0, f"PASS with fresh evidence accepted ({k})") if k == "T-3" else None
         elif "is BLOCKED on task" in text:
             seen["helped"] = True
             dev = re.search(r"Your teammate (\S+) is BLOCKED", text).group(1)
@@ -147,9 +160,14 @@ def main() -> None:
             if h["what"] == "design approval":
                 run(board + ["design-approve", h["key"], "looks good"], repo, env)
                 seen["design_approved"] = True
-        if not seen["restarted"] and seen["qa_fail_sent"]:  # the session crashes once, mid-run
+        if not seen["restarted"] and seen["qa_fail_sent"]:  # the session crashes once, mid-run (power cut)
             seen["restarted"] = True
+            locks = [repo / ".git" / "index.lock"] + [w / "index.lock" for w in (repo / ".git" / "worktrees").iterdir()]
+            for lk in locks:
+                lk.write_text("", encoding="utf-8")
+                os.utime(lk, (1, 1))  # left behind long ago
             out = step("prepare")
+            check(not any(lk.exists() for lk in locks), "stale git locks from the crash removed on restart")
         else:
             out = step("next", done)
         if out["finished"]:
@@ -171,6 +189,12 @@ def main() -> None:
     check(seen.get("optimistic", False), "a developer started on top of work still in QA (no idle wait)")
     check(seen.get("helped", False), "blocked T-4 got a teammate's help and then finished")
     check(tasks["T-1"]["qa_by"] == "pass:lead", "setup task T-1 verified by the lead, no QA agent run")
+    evs = [e for e in json.loads(run(board + ["show", "--json"], repo, env).stdout)]  # board still readable
+    kept = list((repo / ".sdlc" / "state" / "evidence").glob("T-*/*"))
+    check(len(kept) >= 3, f"evidence copied next to the board ({len(kept)} files)")
+    st = run(["git", "status", "--porcelain"], repo, env).stdout + run(
+        ["git", "ls-tree", "-r", "--name-only", "team/2026-01-01-bookmarks"], repo, env).stdout
+    check(".sdlc/evidence" not in st, "evidence files are never committed")
     check(not any("T-1" in k for k in seen.get("qa_runs", [])), "QA never spent a run on the setup task")
     check(any(set(k) >= {"T-2", "T-3"} or set(k) == {"T-3"} for k in seen.get("qa_runs", [])),
           "QA tests story S-2 as a group")

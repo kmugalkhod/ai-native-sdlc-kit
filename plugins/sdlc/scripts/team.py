@@ -43,7 +43,7 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 from board import Board, STATUS_LABEL  # noqa: E402
-from sdlc_core import (audit, changes, find_root, git, header_field, load_config, matches_any,  # noqa: E402
+from sdlc_core import (architecture_problem, audit, changes, find_root, git, header_field, load_config, matches_any,  # noqa: E402
                        portable_cmd, setup_signature, utcnow)
 import trackers  # noqa: E402
 
@@ -52,10 +52,14 @@ BASE_TOOLS = ["Read", "Grep", "Glob"]
 EDIT_TOOLS = ["Edit", "Write", "MultiEdit"]
 SAFE_BASH = ["Bash(python3 .sdlc/bin/*)", "Bash(python .sdlc/bin/*)", "Bash(git status*)", "Bash(git diff*)",
              "Bash(git log*)", "Bash(git show*)", "Bash(git add *)", "Bash(git commit *)", "Bash(ls*)",
-             "Bash(cat *)", "Bash(mkdir *)", "Bash(pwd)"]
-DEV_BASH = ["Bash(git merge *)", "Bash(git checkout -- *)", "Bash(.venv/bin/*)", "Bash(python3 -m pytest*)", "Bash(python -m pytest*)", "Bash(.venv/Scripts/*)",
-            "Bash(npm *)", "Bash(npx *)", "Bash(node *)"]
-QA_BASH = ["Bash(curl *)", "Bash(.venv/bin/*)", "Bash(python3 -m pytest*)", "Bash(python -m pytest*)", "Bash(.venv/Scripts/*)", "Bash(npx playwright*)"]
+             "Bash(cat *)", "Bash(mkdir *)", "Bash(pwd)", "Bash(grep *)", "Bash(head *)", "Bash(tail *)",
+             "Bash(wc *)", "Bash(sort *)", "Bash(find *)", "Bash(which *)", "Bash(echo *)", "Bash(sed -n *)",
+             "Bash(test *)", "Bash(sleep *)", "Bash(cd *)"]
+# the project's own code and scripts run inside the agent's worktree (a headless run has nobody to approve them)
+RUN_BASH = ["Bash(python3 *)", "Bash(python *)", "Bash(py *)", "Bash(.venv/bin/*)", "Bash(.venv/Scripts/*)",
+            "Bash(pytest*)", "Bash(npm *)", "Bash(npx *)", "Bash(node *)", "Bash(uv *)"]
+DEV_BASH = ["Bash(git merge *)", "Bash(git checkout -- *)"] + RUN_BASH
+QA_BASH = ["Bash(curl *)"] + RUN_BASH
 
 
 def log(msg: str) -> None:
@@ -256,7 +260,10 @@ class SimulatedRun(AgentRun):
             if self.behaviour == "fail":
                 board("qa-fail", k, "Empty title is accepted; expected a validation error (400).")
             else:
-                board("qa-pass", k, "All acceptance criteria checked in the browser; screenshot attached.")
+                ev = Path(self.cwd, f"evidence-{k}.txt")
+                ev.write_text(f"HTTP/1.1 200 OK\n{k}: all acceptance criteria checked\n", encoding="utf-8")
+                board("qa-pass", k, "All acceptance criteria checked in the browser; screenshot attached.",
+                      "--evidence", str(ev))
         elif self.role == "helper":
             board("ask", self.behaviour or "developer", "Use ISO 8601 (YYYY-MM-DD); see spec FR-3.", "--task", k)
         elif self.role == "designer":
@@ -277,7 +284,9 @@ class SimulatedRun(AgentRun):
 PLAN_PROMPT = """You are the planner of an AI-native SDLC agent team. Break the accepted change at {rel} into an
 Epic → Stories → Tasks breakdown that {devs} developer agents can build IN PARALLEL in separate git worktrees.
 
-Read {rel}/intent.md, {rel}/spec.md and {rel}/plan.md (whichever exist), CLAUDE.md and the existing code.
+Read {rel}/intent.md, {rel}/spec.md and {rel}/plan.md (whichever exist), CLAUDE.md, sdlc/ARCHITECTURE.md (if it
+exists: the approved architecture — components, data stores and boundaries are decided there; plan within it, never
+around it) and the existing code.
 
 Rules:
 - One epic for the change. Stories follow the spec's user-facing capabilities (2–6 stories).
@@ -296,6 +305,9 @@ Rules:
 - Each task has testable acceptance criteria and a "qa" note: how a QA agent proves it in a browser or via the API.
   For pure setup tasks with nothing a user can try (skeleton, config, tooling, CI), set "qa": "none" — the lead
   checks those with verify instead of a QA agent.
+- Set "check" per task to how hard QA should test it: "light" (internal refactor, config, docs — tests + one API
+  check), "normal" (most features), "deep" (auth, permissions, money, personal data, data migrations, anything
+  whose bug is costly: adversarial inputs, role boundaries, restart persistence).
 - Mark "ui": true on every task that creates or changes something a user sees (pages, components, styles, copy),
   and set the top-level "ui" true if the change has any UI. A designer agent designs those before they are built,
   so UI tasks wait for the design approval and everything else starts at once.
@@ -306,7 +318,7 @@ Do not write any files. Reply with ONLY the breakdown as one JSON object in a ``
 {{"epic": {{"title": "...", "description": "..."}}, "ui": true,
   "stories": [{{"id": "S1", "title": "...", "description": "...", "acceptance": ["..."],
                "tasks": [{{"id": "T1", "title": "...", "description": "...", "files": ["..."],
-                          "acceptance": ["..."], "qa": "...", "ui": false, "depends_on": []}}]}}]}}
+                          "acceptance": ["..."], "qa": "...", "check": "normal", "ui": false, "depends_on": []}}]}}]}}
 """
 
 
@@ -315,6 +327,8 @@ def cmd_plan(root: Path, cfg: dict, a) -> None:
     rel = change.relative_to(root).as_posix()
     if (header_field(change / "intent.md", "Status") or "") not in ("accepted", "approved"):
         sys.exit("intent.md must be Status: accepted before the team plans it")
+    if problem := architecture_problem(root):
+        sys.exit(problem)
     out = change / "breakdown.json"
     if not out.is_file() or a.replan:
         if a.simulate:
@@ -324,8 +338,10 @@ def cmd_plan(root: Path, cfg: dict, a) -> None:
             log(f"planner: breaking {change.name} into epic → stories → tasks")
             b = Board()
             b.upsert_agent("planner", role="planner", status="working", activity="planning")
-            prompt, data, problem = PLAN_PROMPT.format(rel=rel, devs=a.developers or tcfg["developers"]), None, ""
-            for attempt in range(2):  # the lead validates the JSON and writes the file itself
+            devs = a.developers or tcfg["developers"]
+            prompt, data, problem = PLAN_PROMPT.format(rel=rel, devs=devs), None, ""
+            shape: list = []
+            for attempt in range(3):  # the lead validates the JSON and its shape, and writes the file itself
                 r = AgentRun(b, "planner", root, prompt + (f"\n\nYour previous answer was rejected: {problem}. "
                              "Reply again with ONLY the corrected JSON." if problem else ""),
                              tcfg["models"]["planner"], BASE_TOOLS, None, 20,
@@ -333,8 +349,13 @@ def cmd_plan(root: Path, cfg: dict, a) -> None:
                 r.run()
                 data = extract_json(r.result_text)
                 problem = validate_breakdown(data) if data else f"no JSON found ({r.error or r.result_text[-200:]})"
-                if not problem:
+                shape = [] if problem else plan_shape(data, devs, tcfg.get("plan_max_files", 10))
+                if not problem and not shape:
                     break
+                if not problem and attempt == 2:
+                    break  # usable; the remaining shape warnings are shown at the plan gate
+                problem = problem or "; ".join(shape)
+                log(f"planner: plan sent back — {problem[:300]}")
             b.upsert_agent("planner", status="idle", activity="breakdown ready" if not problem else problem[:140])
             if problem:
                 sys.exit(f"planner could not produce a valid breakdown: {problem}")
@@ -349,6 +370,11 @@ def cmd_plan(root: Path, cfg: dict, a) -> None:
         git(root, "commit", "-q", "-m", f"breakdown: {change.name}", "-m", "Epic/stories/tasks for the agent team.")
     sync_once(cfg)
     print_tree(Board())
+    warn = plan_shape(data, max(1, a.developers or cfg["team"]["developers"]), cfg["team"].get("plan_max_files", 10))
+    if warn:
+        print("\nPLAN WARNINGS — fix these in breakdown.json and run plan again (tasks not started yet pick it up):")
+        for w in warn:
+            print(f"  ⚠ {w}")
 
 
 def breakdown_sha(data: dict) -> str:
@@ -411,6 +437,97 @@ def ui_world(root: Path, cfg: dict) -> tuple[str, str]:
     return ("brownfield", f"existing UI files: {', '.join(ui[:5])}") if ui else ("greenfield", "no UI in the repo yet")
 
 
+def plan_shape(data: dict, devs: int, max_files: int) -> list[str]:
+    """Problems with how well a valid breakdown lets {devs} developers work side by side. Simulates the schedule with
+    every task one unit long: if it takes much longer than tasks/devs, a dependency chain is holding the team up."""
+    T = {t["id"]: t for s in data.get("stories", []) for t in s.get("tasks", [])}
+    out = [f"{k} touches {len(t.get('files') or [])} files (max {max_files}): split it into smaller tasks"
+           for k, t in T.items() if len(t.get("files") or []) > max_files]
+    if devs < 2 or len(T) < 2 * devs:
+        return out
+    done, left, run, step = set(), set(T), {}, 0
+    while left or run:
+        for k in [k for k, e in run.items() if e <= step]:
+            done.add(k)
+            run.pop(k)
+        for k in sorted(k for k in left if set(T[k].get("depends_on", [])) <= done)[:devs - len(run)]:
+            run[k] = step + 1
+            left.discard(k)
+        if not run and left:
+            return out  # unreachable dependencies: validate_breakdown reports those
+        step += 1
+    took, ideal = step - 1, -(-len(T) // devs)
+    if took > 1.25 * ideal:
+        depth: dict = {}
+
+        def chain(k):
+            if k not in depth:
+                deps = T[k].get("depends_on", [])
+                depth[k] = [k] + (max((chain(d) for d in deps if d in T), key=len) if deps else [])
+            return depth[k]
+        longest = max((chain(k) for k in T), key=len)[::-1]
+        anc: dict = {}
+
+        def above(k):  # every task k waits on, directly or not
+            if k not in anc:
+                anc[k] = set()
+                for d in T[k].get("depends_on", []):
+                    if d in T:
+                        anc[k] |= {d} | above(d)
+            return anc[k]
+        blocks = {k: sum(k in above(j) for j in T) for k in T}
+        worst = sorted((k for k in T if T[k].get("depends_on")), key=lambda k: -blocks[k])[:3]
+        out.append(f"with {devs} developers this plan takes {took} rounds instead of about {ideal}: developers would "
+                   f"sit idle waiting. Longest chain: {' → '.join(longest)}. Most-waited-on tasks: "
+                   + ", ".join(f"{k} ({blocks[k]} tasks wait)" for k in worst)
+                   + ". Depend only on what a task truly needs (an interface or API contract, not the whole feature); "
+                     "let frontend work build against the API contract; split big tasks.")
+    return out
+
+
+def apply_to_unstarted(b: Board, data: dict) -> bool:
+    """Mid-run plan edit: same tasks in the same order → tasks still in To Do take the new dependencies, text, files
+    and QA note. Started work is never touched. False when tasks were added or removed (needs a reset)."""
+    tasks = sorted(b.items(type_="task"), key=lambda i: i["sort"])
+    new = [t for st in data["stories"] for t in st.get("tasks", [])]
+    if len(tasks) != len(new):
+        log(f"breakdown.json has {len(new)} tasks, the board {len(tasks)}: tasks can't be added or removed mid-run")
+        return False
+    idmap = {t["id"]: i["key"] for t, i in zip(new, tasks)}
+    designs = {d["key"] for d in b.items(type_="design")}
+    changed, skipped = [], []
+    for t, item in zip(new, tasks):
+        deps = [idmap[d] for d in t.get("depends_on", []) if d in idmap]
+        deps += [d for d in item["depends_on"] if d in designs]  # the design gate stays
+        desc = t.get("description", "") + (f"\n\nQA: {t['qa']}" if t.get("qa") else "")
+        fields = {"title": t["title"], "description": desc, "acceptance": t.get("acceptance", []),
+                  "files": t.get("files", []), "depends_on": deps}
+        if all(item.get(k) == v for k, v in fields.items()):
+            continue
+        if item["status"] != "todo":
+            skipped.append(item["key"])
+            continue
+        b.update(item["key"], "human", **{k: json.dumps(v) if isinstance(v, list) else v for k, v in fields.items()})
+        b.event(item["key"], "human", "assign", "plan updated: depends on " + (", ".join(deps) or "nothing"))
+        changed.append(item["key"])
+    log(f"plan updated mid-run: {', '.join(changed) or 'nothing'} changed"
+        + (f"; already started, left as they are: {', '.join(skipped)}" if skipped else ""))
+    return True
+
+
+DEPTHS = ("light", "normal", "deep")
+
+
+def task_depth(cfg: dict, t: dict) -> str:
+    """The planner's "check" wins; otherwise files on risky paths (auth, money, migrations…) are deep."""
+    v = str(t.get("check") or "").strip().lower()
+    if v in DEPTHS:
+        return v
+    from merge_gate import RISKY
+    globs = (cfg.get("checks") or {}).get("deep_globs") or RISKY
+    return "deep" if any(matches_any(f, globs) for f in t.get("files") or []) else "normal"
+
+
 def load_breakdown(root: Path, cfg: dict, change: Path, data: dict, devs: int) -> None:
     b = Board()
     sha = breakdown_sha(data)
@@ -429,6 +546,9 @@ def load_breakdown(root: Path, cfg: dict, change: Path, data: dict, devs: int) -
             b.set_meta(breakdown_sha=sha)  # board from an older kit with work in progress: adopt, keep it
             return
         elif existing == change.name:
+            if apply_to_unstarted(b, data):
+                b.set_meta(breakdown_sha=sha)
+                return
             log("breakdown.json changed but agents have already worked on this board — keeping the board. "
                 "To start over, a human runs: python .sdlc/bin/team.py reset")
             return
@@ -439,7 +559,7 @@ def load_breakdown(root: Path, cfg: dict, change: Path, data: dict, devs: int) -
                integration_branch=f"{cfg['team']['branch_prefix']}{change.name}")
     e = b.add_item("epic", data["epic"]["title"], description=data["epic"].get("description", ""))
     idmap, dev_names = {}, [f"dev-{i + 1}" for i in range(devs)]
-    pending, no_qa = [], []
+    pending, no_qa, depth = [], [], {}
     for s in data["stories"]:
         sk = b.add_item("story", s["title"], e, description=s.get("description", ""),
                         acceptance=s.get("acceptance", []))
@@ -454,6 +574,7 @@ def load_breakdown(root: Path, cfg: dict, change: Path, data: dict, devs: int) -
             pending.append((tk, t.get("depends_on", []), is_ui))
             if str(t.get("qa", "")).strip().lower() in ("none", "skip", "-", "n/a") and not is_ui:
                 no_qa.append(tk)
+            depth[tk] = task_depth(cfg, t)
     # guard: the foundation task must never wait for the design. A "UI" task with no dependencies of its own that
     # non-UI tasks build on directly (typically the skeleton with a placeholder page) starts at once. Real screens
     # (app shell, pages) depend on something, so they keep waiting for the approved design.
@@ -494,7 +615,7 @@ def load_breakdown(root: Path, cfg: dict, change: Path, data: dict, devs: int) -
         load[owner] += 1
         b.update(tk, "lead", depends_on=json.dumps(keys), assignee=owner)
         b.event(tk, "lead", "assign", f"assigned to {owner}")
-    b.set_meta(no_qa=no_qa)
+    b.set_meta(no_qa=no_qa, check_depth=depth)
     b.event(None, "lead", "system", f"plan loaded: {len(data['stories'])} stories, {len(pending)} tasks, "
                                     f"{devs} developers" + (f", design {design_key} first for {len(ui_tasks)} UI task(s)"
                                                             if design_key else ", no UI — no designer needed"))
@@ -550,7 +671,8 @@ Acceptance criteria:
 {acceptance}
 
 It belongs to story {story_key} "{story_title}" of epic "{epic_title}". Everything you need is above; look things up
-in {rel}/spec.md or {rel}/plan.md only when a detail is missing (search them, don't read them whole). Follow CLAUDE.md.
+in {rel}/spec.md or {rel}/plan.md only when a detail is missing (search them, don't read them whole). Follow CLAUDE.md
+and the approved sdlc/ARCHITECTURE.md (where each piece lives and what talks to what) when it exists.
 {extra}
 How to work:
 1. Check messages first: {cli} inbox  (check again after each major step — teammates may answer you).
@@ -578,6 +700,9 @@ Story {story_key} "{story_title}" acceptance: {story_acceptance}
 
 The code is checked out in your own worktree {wt} (branch {branch}).
 {app}
+This run is unattended: nobody can approve a command. If one is refused, don't ask — check the same thing another
+way (the test suite, curl, .venv/bin/python, a script under tests/) and still give a verdict. Ending without
+qa-pass or qa-fail escalates the task to a human.
 Do this:
 1. {cli} inbox — then run `python3 .sdlc/bin/sdlc.py verify` (setup, build, tests, lint). If it fails because the
    toolchain itself is broken (pip/npm install errors, missing tools) — not because of the code — do NOT debug or
@@ -587,8 +712,9 @@ Do this:
 3. If a criterion has no automated test, add one under tests/ (e2e or API) and commit it:
    git add -A && git commit -m "{key}: QA tests"   — do NOT change application code yourself.
 4. Unclear behaviour? Ask the developer: {cli} ask {dev} "question" --task {key}
-5. Verdict — exactly one, then stop:
-   {cli} qa-pass {key} "what you checked and the evidence"
+5. Verdict — exactly one, then stop. A PASS must cite proof you saved during this check (outside the code, e.g.
+   .sdlc/evidence/): the curl response (curl -s ... -o .sdlc/evidence/api.txt), the test log, a screenshot.
+   {cli} qa-pass {key} "what you checked" --evidence <file> [<file> ...]
    {cli} qa-fail {key} "steps to reproduce · expected · actual"
 """
 
@@ -1403,10 +1529,13 @@ Toolchain broken (installs fail, a tool is missing)? Don't fight it for more tha
 TL_DEV = """ASSIGNMENT — story {story_key} "{story_title}" (epic "{epic_title}"), branch {branch}.
 Build these {n} task(s) in this order:
 {tasks}
-{extra}
+{extra}{builds_on}
 How to work (fast, and the quality bar does not move):
+0. Write code early. Read each file you change and the files listed under "Code you build on" ONCE, whole, with the
+   Read tool — not in grep/sed/cat slices — and don't explore the rest of the repo. Your first file change should
+   come within about 5 minutes.
 1. The tasks above are your spec. Only when a detail is missing, search {rel}/spec.md or {rel}/plan.md — don't read
-   them whole. Follow CLAUDE.md.
+   them whole. Follow CLAUDE.md, and sdlc/ARCHITECTURE.md when it exists (search it for your component).
 2. Scaffolding (a new frontend/backend project, config) comes from the official generators, e.g.
    `npm create vite@latest frontend -- --template react-ts`, then adjust — don't hand-type boilerplate.
 3. New packages go into the manifest, then `{py} .sdlc/bin/sdlc.py verify setup`. Never install by hand.
@@ -1438,10 +1567,22 @@ How to test (fast, thorough) — time budget: about {budget} minutes. Effort mat
    calls instead and say so in the verdict. Don't install browsers or packages.
 3. A criterion without an automated test? Add one under tests/ and commit it (git add -A && git commit -m "<key>: QA
    tests"). Do NOT change application code.
-4. One verdict per task, each with evidence:
-   {cli} qa-pass <key> "what you checked and the evidence"
+4. One verdict per task. A PASS must cite proof you saved during this check, in .sdlc/evidence/ (not committed):
+   the curl response (curl -s ... -o .sdlc/evidence/<key>-api.txt), the test log (... > .sdlc/evidence/<key>-tests.txt),
+   a screenshot. The board refuses a PASS without fresh proof.
+   {cli} qa-pass <key> "what you checked" --evidence <file> [<file> ...]
    {cli} qa-fail <key> "steps to reproduce · expected · actual"
 {design}"""
+
+
+DEPTH_FOR_QA = {
+    "light": "\nCheck depth: LIGHT (low risk). The tests plus one API or CLI check per criterion are enough: no "
+             "browser pass, no extra test files unless a criterion has none.\n",
+    "normal": "",
+    "deep": "\nCheck depth: DEEP (a bug here is costly). Beyond the criteria, try adversarial input, every role and "
+            "permission boundary (a user acting on another user's data), restart persistence (stop and start the "
+            "app: is the data still there?), and repeat/concurrent actions. Add a test for each thing you find.\n",
+}
 
 
 class _Done:
@@ -1542,6 +1683,44 @@ class TeamLead(Lead):
         status = {"designer": "designing", "helper": "helping"}.get(kind, "working")
         self.b.upsert_agent(agent, status=status, item_key=keys[0], activity=f"assigned: {title[:80]}")
         self.b.event(keys[0], "lead", "assign", f"{agent} ← {kind} {', '.join(keys)}")
+
+    def builds_on(self, batch: list, wt: Path) -> str:
+        """The code this batch builds on: the files of the tasks it depends on (and theirs), as they exist in the
+        developer's worktree — so it reads those few files instead of exploring the repo."""
+        keys = {t["key"] for t in batch}
+        seen, todo, lines = set(), [d for t in batch for d in t["depends_on"]], []
+        while todo and len(seen) < 12:
+            k = todo.pop(0)
+            if k in seen or k in keys:
+                continue
+            seen.add(k)
+            t = self.b.item(k)
+            if not t or t.get("type") != "task":
+                continue
+            files = [f for f in t.get("files") or [] if (wt / f).exists()][:8]
+            if files:
+                lines.append(f"- {k} {t['title']}: " + ", ".join(files))
+            if len(seen) <= 3:
+                todo += t.get("depends_on") or []
+        return ("\nCode you build on (already in your worktree — read these, not the whole repo):\n" + "\n".join(lines) + "\n"
+                if lines else "")
+
+    def notify_human(self, human: list) -> None:
+        """Each new thing that waits for the human reaches the phone once, with the buttons that answer it."""
+        try:
+            import notify
+            for h in human:
+                if h["what"] == "design approval":
+                    notify.send(self.root, self.cfg, "needs_you", f"🎨 Design {h['key']} is ready for you",
+                                f"{h.get('summary') or ''}\nMockup: {h.get('mockup')}",
+                                [{"label": "Approve", "action": f"approve:{h['key']}"},
+                                 {"label": "Request changes", "action": f"changes:{h['key']}"}], h["key"])
+                elif h["what"] == "escalated":
+                    t = self.b.item(h["key"]) or {}
+                    notify.send(self.root, self.cfg, "needs_you", f"⚑ {h['key']} needs you: {t.get('title', '')}",
+                                h.get("why") or "", [{"label": "Answer", "action": f"answer:{h['key']}"}], h["key"])
+        except Exception:
+            pass
 
     def tasks_text(self, ts: list) -> str:
         out = []
@@ -1804,6 +1983,8 @@ class TeamLead(Lead):
         story = self.b.item(ts[0]["parent_key"]) or {}
         browser = (" with the browser tools (mcp__playwright__*: navigate, snapshot, click, type, screenshot)"
                    if self.t["qa"].get("browser") == "playwright-mcp" else " with Playwright (npx playwright / python)")
+        depths = (self.b.meta().get("check_depth") or {})
+        depth = max((depths.get(t["key"], "normal") for t in ts), key=DEPTHS.index)
         design = (DESIGN_FOR_QA.format(mockup_url=self.mockup_url())
                   if self.design and any(self.design["key"] in t["depends_on"] for t in ts) else "")
         body = TL_QA.format(story_key=story.get("key"), story_title=story.get("title"), branch=qa_branch,
@@ -1811,8 +1992,9 @@ class TeamLead(Lead):
                             app=(f"The lead started the app for you at {app}. Stop nothing; the lead stops it."
                                  if app else "No app server is configured (team.qa.start_cmd): test through the "
                                              "test suite and API calls."),
-                            browser=browser, design=design,
-                            budget=max(5, int(self.t["qa"].get("minutes_per_task", 4)) * len(ts)))
+                            browser=browser, design=design + DEPTH_FOR_QA[depth],
+                            budget=max(5, round(int(self.t["qa"].get("minutes_per_task", 4)) * len(ts)
+                                                * {"light": 0.5, "normal": 1, "deep": 2}[depth])))
         self.assign(agent, "qa", "qa", [t["key"] for t in ts], f"QA {story.get('key')}: {story.get('title')}", body, wt)
 
     # ---------------------------------------------------------------- 6. help
@@ -1883,7 +2065,13 @@ class TeamLead(Lead):
         changed = set(sh(["git", "diff", "--name-only", f"{self.integration}...HEAD"], wt).stdout.split())
         changed |= {ln[3:].strip().strip('"').replace("\\", "/")
                     for ln in sh(["git", "status", "--porcelain", "-uall"], wt).stdout.splitlines()}
-        planned = {f.replace("\\", "/").rstrip("/") for f in t.get("files") or []}
+        norm = lambda fs: {f.replace("\\", "/").rstrip("/") for f in fs or []}
+        planned = norm(t.get("files"))
+        # files other tasks of the same assignment also change (gateway.py, app.py…) prove nothing about this task
+        job = next((j for a_, j in self.jobs.items() if a_ == agent), {})
+        for k in job.get("keys", []):
+            if k != t["key"]:
+                planned -= norm((self.b.item(k) or {}).get("files"))
         return any(c in planned or any(c.startswith(f + "/") for f in planned) for c in changed)
 
     def rebalance(self, idle: str) -> list:
@@ -1977,6 +2165,7 @@ class TeamLead(Lead):
         epic = self.b.item(story.get("parent_key") or "") or {}
         body = TL_DEV.format(story_key=story.get("key"), story_title=story.get("title"), epic_title=epic.get("title"),
                              branch=branch, n=len(batch), tasks=self.tasks_text(batch), extra=extra, rel=self.rel,
+                             builds_on=self.builds_on(batch, wt),
                              py=PY, cli=BOARD_CLI, budget=max(10, int(self.t["run_timeout_minutes"] * 0.6)))
         for t in batch:
             self.b.update(t["key"], "lead", status="in_progress", assignee=dev, branch=branch)
@@ -2018,13 +2207,20 @@ class TeamLead(Lead):
                               "summary": d.get("note") or ""})
         for k in sorted(self.escalated):
             t = self.b.item(k) or {}
-            human.append({"key": k, "what": "escalated", "why": t.get("note") or ""})
+            human.append({"key": k, "what": "escalated", "why": self.b.escalation_reason(k) or t.get("note") or ""})
         working = [{"agent": a, "keys": j["keys"], "kind": j["kind"],
                     "minutes": int((time.time() - j["started"]) / 60), "budget": j.get("budget", 0)}
                    for a, j in self.jobs.items()]
+        self.notify_human(human)
         finished = bool(ts) and all(t["status"] == "done" or t["key"] in self.escalated for t in ts) and not self.jobs
         if finished:
             self.b.set_meta(status="done" if not self.escalated else "needs-human")
+        gap = [] if self.a.simulate else missing_allow(self.root)
+        if gap:
+            human.insert(0, {"key": "-", "what": "permissions",
+                             "why": f"{len(gap)} commands teammates use are not pre-approved, so each one waits for "
+                                    "a click in this window (about a minute per command). Ask the user, then run "
+                                    "team.py allow."})
         return {"assignments": self.assignments, "waiting_for_human": human, "working": working,
                 "progress": f"{sum(t['status'] == 'done' for t in ts)}/{len(ts)} tasks done",
                 "finished": finished, "board": self.board_url}
@@ -2038,10 +2234,35 @@ def tl_args(a):
     return a
 
 
+def clear_stale_git_locks(root: Path, older_than: float = 120) -> list:
+    """A crash or power cut mid-commit leaves *.lock files that make every later git command fail ("Unable to create
+    index.lock: File exists"). At session start no teammate is running, so locks older than a couple of minutes are
+    leftovers: remove them."""
+    gitdir = root / ".git"
+    if not gitdir.is_dir():
+        return []
+    gone = []
+    for pat in ("index.lock", "HEAD.lock", "ORIG_HEAD.lock", "config.lock", "packed-refs.lock",
+                "worktrees/*/index.lock", "worktrees/*/HEAD.lock", "refs/**/*.lock"):
+        for f in gitdir.glob(pat):
+            try:
+                if time.time() - f.stat().st_mtime > older_than:
+                    f.unlink()
+                    gone.append(str(f.relative_to(root)))
+            except OSError:
+                pass
+    if gone:
+        log(f"removed stale git locks left by a crash: {', '.join(gone)}")
+    sh(["git", "worktree", "prune"], root)
+    return gone
+
+
 def cmd_prepare(root: Path, cfg: dict, a) -> None:
     """Start (or restart) an agent-teams session: plan if needed, worktrees, installs, first assignments."""
     os.environ["SDLC_LOG_STDERR"] = "1"
     a = tl_args(a)
+    with contextlib.redirect_stdout(sys.stderr):
+        clear_stale_git_locks(root)
     change = resolve_change(root, cfg, a.change)
     with contextlib.redirect_stdout(sys.stderr):  # stdout carries only the JSON for the session lead
         cmd_plan(root, cfg, a)
@@ -2095,6 +2316,16 @@ def cmd_watch(root: Path, cfg: dict, a) -> None:
         except ValueError:
             seen = {}
         b = Board()
+        try:  # the supervisor's findings: in act mode the lead relays them, in trial mode they only go to the board
+            import supervisor
+            told = [f for f in supervisor.check(root, cfg, b) if f["mode"] == "act"]
+        except Exception:
+            told = []
+        if told:
+            print(json.dumps({"over_budget": [], "work_waiting": [], "supervisor": told,
+                              "do": "SendMessage each entry's message to its 'to' teammate (for 'lead' entries run "
+                                    "the 'do' command), then start watch again"}, indent=2))
+            return
         jobs = (b.meta().get("tl") or {}).get("jobs", {})
         # an idle developer while another developer moves on to its next task → `next` may hand over untouched work
         heads = {ag: git(wt_root / ag, "rev-parse", "HEAD") for ag, j in jobs.items() if j.get("kind") == "developer"
@@ -2110,7 +2341,19 @@ def cmd_watch(root: Path, cfg: dict, a) -> None:
         # handed-in work waiting while a QA teammate has nothing to do → the lead should run `next` now
         qas = [ag["name"] for ag in b.agents() if (ag.get("role") or "") == "qa"]
         waiting = sorted(t["key"] for t in b.items(type_="task") if t["status"] == "in_qa" and not t.get("qa_by"))
-        if waiting and any(q not in jobs for q in qas):
+        # a branch whose every task passed QA and nobody is still on it → ready to merge in the next step
+        on_branch: dict = {}
+        for t in b.items(type_="task"):
+            if t.get("branch"):
+                on_branch.setdefault(t["branch"], []).append(t)
+        busy = {k for j in jobs.values() for k in j.get("keys", [])}
+        ready = sorted(ts[0]["key"] for ts in on_branch.values()
+                       if any(t["status"] == "in_qa" for t in ts)
+                       and all(t["status"] == "done" or (t["status"] == "in_qa"
+                               and (t.get("qa_by") or "").startswith("pass:")) for t in ts)
+                       and not busy & {t["key"] for t in ts})
+        waiting += [f"merge {k}" for k in ready]
+        if ready or (waiting and any(q not in jobs for q in qas)):
             print(json.dumps({"over_budget": [], "work_waiting": waiting,
                               "do": "run team.py next <change> (no --done) and relay its assignments"}, indent=2))
             return
@@ -2138,7 +2381,21 @@ TEAM_ALLOW = ["Bash(cd *)", "Bash(git status*)", "Bash(git diff*)", "Bash(git lo
               "Bash(python *)", "Bash(python3 *)", "Bash(py *)", "Bash(pytest*)", "Bash(npm *)", "Bash(npx *)",
               "Bash(node *)", "Bash(uv *)", "Bash(pip *)", "Bash(curl *)", "Bash(ls*)", "Bash(cat *)", "Bash(head *)",
               "Bash(tail *)", "Bash(grep *)", "Bash(mkdir *)", "Bash(echo *)", "Bash(.venv/*)", "Bash(.venv\\*)",
-              "Read", "Edit", "Write", "Glob", "Grep", "mcp__playwright"]
+              "Bash(sed *)", "Bash(cut *)", "Bash(wc *)", "Bash(sort *)", "Bash(uniq *)", "Bash(find *)",
+              "Bash(diff *)", "Bash(printf *)", "Bash(test *)", "Bash(cp *)", "Bash(mv *)", "Bash(touch *)",
+              "Bash(pwd*)", "Bash(which *)", "Bash(rg *)", "Bash(true*)", "Bash(sleep *)", "Bash(export *)",
+              "Bash(PYTHONPATH=*)", "Bash(git branch*)", "Bash(git stash*)", "Bash(git restore*)",
+              "Read", "Edit", "Write", "Glob", "Grep", "Skill", "mcp__playwright"]
+
+
+def missing_allow(root: Path) -> list:
+    """Pre-approval rules for teammates that are not in .claude/settings.local.json (empty when all are there)."""
+    try:
+        data = json.loads((root / ".claude" / "settings.local.json").read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        data = {}
+    have = set((data.get("permissions") or {}).get("allow") or [])
+    return [r for r in TEAM_ALLOW if r not in have]
 TEAM_DENY = ["Bash(git push*)", "Bash(git reset --hard*)", "Bash(rm -rf *)"]
 
 

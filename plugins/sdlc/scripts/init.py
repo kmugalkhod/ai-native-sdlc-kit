@@ -19,7 +19,8 @@ from pathlib import Path
 PLUGIN = Path(__file__).resolve().parent.parent
 TEMPLATES = PLUGIN / "templates"
 BIN_FILES = ["sdlc_core.py", "sdlc.py", "pipeline.py", "evals.py", "monitor.py", "loop.py",
-             "board.py", "team.py", "trackers.py", "board_server.py"]
+             "board.py", "team.py", "trackers.py", "board_server.py", "why_slow.py", "merge_gate.py", "doctor.py", "cost_report.py",
+             "mutate.py", "notify.py", "supervisor.py", "manager.py", "schedule.py", "arch_export.py"]
 CI_FILES = {
     "github": [".github/workflows/agent-evals.yml", ".github/workflows/claude-review.yml",
                ".github/workflows/sdlc-loop.yml", ".github/workflows/sdlc-monitor.yml"],
@@ -33,6 +34,7 @@ COMMON = [
     "sdlc/changes/.gitkeep", "sdlc/lessons/README.md",
     "sdlc/monitor/bands.yaml", "sdlc/monitor/sample_series.csv",
     "evals/cases/verify-before-done.json", "evals/README.md",
+    "sdlc/MISSION.md", "sdlc/defects.json", ".ignore",
 ]
 
 
@@ -97,6 +99,16 @@ def main() -> None:
             skipped.append(f".sdlc/bin/{f}"); continue
         shutil.copy2(PLUGIN / "scripts" / f, dst)
         created.append(f".sdlc/bin/{f}")
+
+    # kit-private folders stay out of commits, also in projects set up by an older kit
+    sgi = root / ".sdlc" / ".gitignore"
+    shave = sgi.read_text(encoding="utf-8").splitlines() if sgi.exists() else []
+    smissing = [x for x in ("state/", "worktrees/", "evidence/", "audit.jsonl", "__pycache__/") if x not in shave]
+    if smissing:
+        sgi.parent.mkdir(parents=True, exist_ok=True)
+        with open(sgi, "a", encoding="utf-8") as f:
+            f.write(("\n" if shave and shave[-1] else "") + "\n".join(smissing) + "\n")
+        created.append(".sdlc/.gitignore (+" + ", ".join(smissing) + ")")
 
     # keep installed dependencies out of commits (the headless loop commits with `git add -A`)
     gi = root / ".gitignore"

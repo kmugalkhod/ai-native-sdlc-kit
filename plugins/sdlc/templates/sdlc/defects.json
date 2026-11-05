@@ -1,0 +1,6 @@
+{
+  "_what_this_is": "Deliberate bugs. mutate.py injects each one into a throwaway state of the real source, runs the test command, and restores it. Every one must turn the tests red. One that escapes is a kind of bug that could merge without anyone noticing. Owner: humans only (agents can't edit this file).",
+  "_how_to_write_one": "id: what broke · file: path from the repo root · find: a SHORT exact snippet that appears once · replace: what to put there instead · why: what it would mean if this escaped",
+  "_start_here": "Aim at the seams, not syntax: a comparison flipped, a counter that never moves, an output made constant, an error path that succeeds, a database write dropped, an off-by-one at a boundary.",
+  "defects": []
+}

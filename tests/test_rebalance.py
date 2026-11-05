@@ -20,6 +20,14 @@ PY = sys.executable
 FAILS: list[str] = []
 
 
+def proof(repo: Path, key: str) -> str:
+    """What a QA agent saves during its check (a curl response, a test log)."""
+    f = repo / ".sdlc" / "evidence" / f"{key}-api.txt"
+    f.parent.mkdir(parents=True, exist_ok=True)
+    f.write_text(f"HTTP/1.1 200 OK\n{key} checked\n", encoding="utf-8")
+    return str(f)
+
+
 def check(cond: bool, what: str) -> None:
     print(("PASS " if cond else "FAIL ") + what)
     if not cond:
@@ -46,10 +54,11 @@ def main() -> None:
     ch = repo / "sdlc" / "changes" / "2026-01-01-api"
     ch.mkdir(parents=True)
     (ch / "intent.md").write_text("Status: accepted\n", encoding="utf-8")
-    t = lambda i, f: {"id": i, "title": f"task {i}", "files": [f], "acceptance": ["ok"], "qa": "check", "ui": False,
-                      "depends_on": []}
+    t = lambda i, f: {"id": i, "title": f"task {i}", "files": [f, "app/shared.py"] if i == "T1" else [f],
+                      "acceptance": ["ok"], "qa": "check", "ui": False, "depends_on": []}
     (ch / "breakdown.json").write_text(json.dumps({"epic": {"title": "API"}, "ui": False, "stories": [
-        {"id": "S1", "title": "Providers", "tasks": [t("T1", "app/a.py"), t("T2", "app/b.py"), t("T3", "app/c.py")]},
+        {"id": "S1", "title": "Providers", "tasks": [t("T1", "app/a.py"), {**t("T2", "app/b.py"), "files": ["app/b.py", "app/shared.py"]},
+                                                     t("T3", "app/c.py")]},
         {"id": "S2", "title": "Admin", "tasks": [t("T4", "app/d.py")]}]}), encoding="utf-8")
     run(["git", "add", "-A"], repo, env)
     run(["git", "commit", "-qm", "init"], repo, env)
@@ -73,8 +82,10 @@ def main() -> None:
     check(a.get("dev-2", {}).get("keys") == ["T-4"], "dev-2 got the other story")
     d1 = Path(a["dev-1"]["file"]).read_text(encoding="utf-8")
     w1 = wt(d1)
+    (w1 / "app").mkdir(exist_ok=True)
+    (w1 / "app" / "shared.py").write_text("# edited for T-1, also planned by T-2\n", encoding="utf-8")
     build("dev-2", ["T-4"], Path(a["dev-2"]["file"]).read_text(encoding="utf-8"))
-    # dev-1 has not even touched a file yet: it is on T-1, so T-2 and T-3 can still go to the idle dev-2
+    # dev-1 touched only a file T-1 and T-2 share: T-2 has not started, so it can still move: it is on T-1, so T-2 and T-3 can still go to the idle dev-2
 
     out = step("next", "--done", "dev-2")
     a = {x["agent"]: x for x in out["assignments"]}
@@ -113,7 +124,7 @@ def main() -> None:
         for x in out["assignments"]:
             if x["agent"].startswith("qa"):
                 for k in x["keys"]:
-                    run(board + ["--as", x["agent"], "--role", "qa", "qa-pass", k, "ok"], repo, env, ok=False)
+                    run(board + ["--as", x["agent"], "--role", "qa", "qa-pass", k, "ok", "--evidence", proof(repo, k)], repo, env, ok=False)
                 done.append(x["agent"])
         out = step("next", "--done", "dev-1", "dev-2", *done)
         if out["finished"]:

@@ -4,6 +4,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 sys.path.insert(0, str(__import__("pathlib").Path(__file__).resolve().parents[1] / "plugins/sdlc/scripts"))
 
 CALLS = []
+JC, LC = {}, {}  # comments per Jira issue key / Linear issue id
 class H(BaseHTTPRequestHandler):
     def log_message(self, *a): pass
     def _send(self, obj, code=200):
@@ -13,6 +14,11 @@ class H(BaseHTTPRequestHandler):
         n = int(self.headers.get("Content-Length") or 0); return json.loads(self.rfile.read(n) or b"{}")
     def do_GET(self):
         CALLS.append(("GET", self.path, None, self.headers.get("Authorization")))
+        if self.path == "/rest/api/3/myself":
+            return self._send({"accountId": "bot"})
+        m = re.match(r"/rest/api/3/issue/([^/]+)/comment", self.path)
+        if m:
+            return self._send({"comments": JC.get(m.group(1), [])})
         if self.path.endswith("/transitions"):
             return self._send({"transitions":[{"id":"11","name":"Start","to":{"name":"In Progress"}},
                                                {"id":"21","name":"In Review","to":{"name":"In Review"}},
@@ -25,8 +31,19 @@ class H(BaseHTTPRequestHandler):
         if self.path == "/rest/api/3/issue":
             n = sum(1 for c in CALLS if c[0]=="POST" and c[1]=="/rest/api/3/issue")
             return self._send({"id": str(n), "key": f"PROJ-{n}"}, 201)
+        m = re.match(r"/rest/api/3/issue/([^/]+)/comment$", self.path)
+        if m:
+            JC.setdefault(m.group(1), []).append({"id": str(len(JC[m.group(1)]) + 100), "author": {"accountId": "bot"},
+                                                  "body": body["body"], "created": "2026-01-01T00:00:00Z"})
+            return self._send({}, 201)
         if self.path == "/graphql":
             q = body["query"]
+            if "viewer{id}" in q:
+                return self._send({"data": {"viewer": {"id": "me"}, "issue": {"comments": {"nodes": LC.get(body["variables"]["id"], [])}}}})
+            if "commentCreate" in q:
+                i = body["variables"]["i"]
+                LC.setdefault(i["issueId"], []).append({"id": f"c{len(LC[i['issueId']])}", "body": i["body"], "user": {"id": "me"}})
+                return self._send({"data": {"commentCreate": {"success": True}}})
             if "teams(" in q: return self._send({"data":{"teams":{"nodes":[{"id":"team1","key":"ENG","states":{"nodes":[{"id":"s1","name":"Todo"},{"id":"s2","name":"In Progress"},{"id":"s3","name":"In Review"},{"id":"s4","name":"Done"}]}}]}}})
             if "projectCreate" in q: return self._send({"data":{"projectCreate":{"success":True,"project":{"id":"p1","url":"https://linear.app/x/project/p1"}}}})
             if "issueCreate" in q:
@@ -75,6 +92,19 @@ check(len(coms) == 2 and "[qa-1] PASS" in json.dumps(coms), "jira: hand-off + QA
 CALLS.clear(); sync.run()
 check(not CALLS or all(c[0]=="GET" for c in CALLS), "jira: idempotent second run (no new writes)")
 
+# reply-to-resume: an escalated task asks on the issue; a human's reply there resumes it
+b.update(t, "lead", note="ESCALATED to a human: which date format does the API expect?", status="blocked")
+b.set_meta(escalated=[t]); ext = b.item(t)["ext_key"]; sync.run()
+asks = [c for c in JC.get(ext, []) if "sdlc-ask" in json.dumps(c)]
+check(len(asks) == 1 and "which date format" in json.dumps(asks), "jira: escalation asked as a comment on the issue")
+sync.run(); check(t in b.meta().get("escalated", []), "jira: no reply yet → still escalated (its own question doesn't count)")
+JC[ext].append({"id": "900", "author": {"accountId": "kunal", "displayName": "Kunal"}, "created": "2026-01-01T01:00:00Z",
+                "body": {"type": "doc", "version": 1, "content": [{"type": "paragraph", "content": [{"type": "text", "text": "Use ISO 8601 dates"}]}]}})
+sync.run()
+hist = json.dumps(b.events(item_key=t, limit=50))
+check(t not in b.meta().get("escalated", []) and "Use ISO 8601 dates" in hist and b.item(t)["status"] != "blocked",
+      "jira: the reply resumed the task with it as guidance")
+
 # ---------------- Linear
 os.environ.update(LINEAR_API_KEY="lin_api_x", LINEAR_API_URL=base + "/graphql"); CALLS.clear()
 b2 = Board(tempfile.mktemp(suffix=".db")); e2, s2, t2 = seed(b2)
@@ -88,4 +118,10 @@ CALLS.clear(); b2.update(t2, "lead", status="in_progress", assignee="dev-2"); ls
 qs = [c[2] for c in CALLS if c[1]=="/graphql"]
 check(any("issueAddLabel" in q["query"] for q in qs) and any("issueLabelCreate" in q["query"] for q in qs), "linear: agent label created + added")
 check(any("issueUpdate" in q["query"] and q["variables"]["i"].get("stateId")=="s2" for q in qs), "linear: state -> In Progress")
+b2.set_meta(escalated=[t2]); b2.update(t2, "lead", note="ESCALATED to a human: unclear scope", status="blocked"); lsync.run()
+lid = b2.item(t2)["ext_key"]
+check(any("sdlc-ask" in c["body"] for c in LC.get(lid, [])), "linear: escalation asked as a comment")
+LC[lid].append({"id": "c99", "body": "Only the API, no UI", "user": {"id": "u-kunal", "name": "Kunal"}}); lsync.run()
+check(t2 not in b2.meta().get("escalated", []) and "Only the API" in json.dumps(b2.events(item_key=t2, limit=50)),
+      "linear: the reply resumed the task")
 print("ALL PASS" if ok else "SOME FAILED"); srv.shutdown(); sys.exit(0 if ok else 1)
