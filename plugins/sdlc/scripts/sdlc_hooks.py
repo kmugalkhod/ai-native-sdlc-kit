@@ -19,12 +19,24 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 from sdlc_core import audit, find_root, git, load_config, matches_any, read_state, rel_to_root  # noqa: E402
 
-# Repo files the agent must never change itself: its own gates, state and audit trail.
-SELF_PROTECTED = [".sdlc/config.json", ".sdlc/state/**", ".sdlc/bin/**", ".sdlc/audit.jsonl"]
+# Repo files the agent must never change itself: its own gates, state and audit trail, and what humans own.
+SELF_PROTECTED = [".sdlc/config.json", ".sdlc/state/**", ".sdlc/bin/**", ".sdlc/audit.jsonl", "sdlc/MISSION.md",
+                  "sdlc/defects.json", ".ignore"]
+# Hidden holdout scenarios: no builder may read them; only the holdout writer / verifier agents.
+HOLDOUT_DIR = "sdlc/holdout"
+HOLDOUT_AGENTS = {"holdout-writer", "holdout-verifier", "sdlc:holdout-writer", "sdlc:holdout-verifier"}
+GIT_PRINTS = {"show", "log", "diff", "grep", "blame", "cat-file", "whatchanged"}  # read-only ones
 HELPER_RE = re.compile(r"^\s*(python3?|py)(\s+-\w+)*\s+\.sdlc/bin/[\w-]+\.py\b")
 WRITE_VERB_RE = re.compile(
     r"(^|\s)(rm|mv|cp|tee|truncate|chmod|chown|ln|dd|install|unlink|shred)(\s|$)|"
     r"\bsed\s+(-\w*i|--in-place)|\bperl\s+-\w*i|(?<![0-9&>-])>{1,2}(?!&)|\bgit\s+(checkout|restore|rm|mv)\b|\bset-content\b|\bout-file\b",
+    re.I,
+)
+GOV_RE = re.compile(r"\.sdlc[/\\](config\.json|state|bin|audit\.jsonl)")
+REDIRECT_RE = re.compile(r"(?<![0-9&>-])>{1,2}\|?\s*([^\s;|&)]+)")
+VERB_RE = re.compile(
+    r"(^|\s)(rm|mv|cp|tee|truncate|chmod|chown|ln|dd|install|unlink|shred)(\s|$)|"
+    r"\bsed\s+(-\w*i|--in-place)|\bperl\s+-\w*i|\bgit\s+(checkout|restore|rm|mv)\b|\bset-content\b|\bout-file\b",
     re.I,
 )
 SECRET_PATTERNS = {
@@ -68,6 +80,89 @@ def fix_mode(root: Path) -> dict | None:
     return read_state(root, "fix-mode.json")
 
 
+# ---------------------------------------------------------------- holdout fence
+def holdout_ok(payload: dict) -> bool:
+    """Only the holdout writer / verifier see the scenarios: launched with SDLC_HOLDOUT_ACCESS=1 by the pipeline,
+    or a subagent of that type."""
+    return os.environ.get("SDLC_HOLDOUT_ACCESS") == "1" or str(payload.get("agent_type") or "") in HOLDOUT_AGENTS
+
+
+def in_holdout(root: Path, path: str) -> bool:
+    if not path:
+        return False
+    rel = rel_to_root(root, str(path)).rstrip("/")
+    return rel == HOLDOUT_DIR or rel.startswith(HOLDOUT_DIR + "/") or bool(re.search(r"(^|[/\\])holdout([/\\]|$)", str(path)))
+
+
+def holdout_lines(root: Path) -> set[str]:
+    """Distinctive lines of every scenario: if one shows up in a tool's output, a builder has seen it."""
+    out = set()
+    d = root / HOLDOUT_DIR
+    for f in d.rglob("*") if d.is_dir() else []:
+        if f.is_file():
+            for ln in f.read_text(encoding="utf-8", errors="replace").splitlines():
+                ln = ln.strip().lstrip("-*#> ").strip()
+                if len(ln) >= 30:
+                    out.add(ln)
+    return out
+
+
+def exposed(root: Path, text: str) -> list[str]:
+    return [ln for ln in holdout_lines(root) if ln in text][:3]
+
+
+def holdout_deny(root: Path, what: str, **fields) -> None:
+    block(root, f"{what} would show the hidden holdout scenarios ({HOLDOUT_DIR}/). They are an exam no builder may "
+                "see; build from intent.md, spec.md and plan.md instead.", **fields)
+
+
+def pre_read(root: Path, cfg: dict, payload: dict) -> None:
+    if holdout_ok(payload) or not (root / HOLDOUT_DIR).is_dir():
+        return
+    ti = payload.get("tool_input") or {}
+    for k in ("file_path", "notebook_path", "path", "pattern", "glob"):
+        v = ti.get(k)
+        if v and (in_holdout(root, v) or (k in ("pattern", "glob") and "holdout" in str(v).lower()
+                                          and payload.get("tool_name") == "Glob")):
+            holdout_deny(root, f"{payload.get('tool_name') or 'This read'} of {v}", path=str(v))
+
+
+def post_read(root: Path, cfg: dict, payload: dict) -> None:
+    """A leak the fence did not foresee is still counted: scenario text in any tool output is recorded."""
+    if holdout_ok(payload) or not (root / HOLDOUT_DIR).is_dir():
+        return
+    hits = exposed(root, json.dumps(payload.get("tool_response") or payload.get("tool_output") or "", ensure_ascii=False))
+    if hits:
+        common = git(root, "rev-parse", "--git-common-dir") or ".git"
+        log = (root / common if not Path(common).is_absolute() else Path(common)) / "sdlc-holdout-exposures.jsonl"
+        with open(log, "a", encoding="utf-8") as f:
+            f.write(json.dumps({"ts": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
+                                "tool": payload.get("tool_name"), "cwd": payload.get("cwd"),
+                                "branch": git(Path(payload.get("cwd") or root), "rev-parse", "--abbrev-ref", "HEAD"),
+                                "lines": len(hits)}) + "\n")
+        audit(root, "holdout-exposure", tool=payload.get("tool_name"))
+
+
+def bash_holdout(root: Path, payload: dict, segs: list[str]) -> None:
+    if holdout_ok(payload) or not (root / HOLDOUT_DIR).is_dir():
+        return
+    cwd = Path(payload.get("cwd") or root)
+    for seg in segs:
+        if re.search(r"(^|[\s'\"=/\\])(sdlc[/\\])?holdout([/\\*'\"\s]|$)", seg):
+            holdout_deny(root, "This command", command=seg)
+        t = tokens(seg)
+        if len(t) >= 2 and t[0] == "git" and (set(t[1:3]) & GIT_PRINTS):
+            # git is asked first: run the read-only command ourselves and look for scenario text in what it prints
+            try:
+                r = subprocess.run(t, cwd=cwd, capture_output=True, text=True,
+                                   encoding="utf-8", errors="replace", timeout=15,
+                                   env={**os.environ, "GIT_PAGER": "cat", "PAGER": "cat"})
+                if exposed(root, r.stdout):
+                    holdout_deny(root, f"`{seg[:60]}`", command=seg)
+            except (subprocess.TimeoutExpired, OSError):
+                pass
+
+
 # ---------------------------------------------------------------- pre-edit
 def pre_edit(root: Path, cfg: dict, payload: dict) -> None:
     ti = payload.get("tool_input") or {}
@@ -75,6 +170,10 @@ def pre_edit(root: Path, cfg: dict, payload: dict) -> None:
     if not path:
         return
     rel = rel_to_root(root, path)
+    if in_holdout(root, path) and not holdout_ok(payload) and (root / HOLDOUT_DIR).is_dir():
+        holdout_deny(root, f"Writing {rel}", path=rel)
+    if in_holdout(root, path) and holdout_ok(payload):
+        return  # the holdout writer owns its folder
 
     hit = matches_any(rel, SELF_PROTECTED)
     if hit:
@@ -122,12 +221,23 @@ def release_approval(root: Path, cfg: dict) -> str | None:
 def pre_bash(root: Path, cfg: dict, payload: dict) -> None:
     cmd = (payload.get("tool_input") or {}).get("command", "") or ""
     segs = segments(cmd)
+    bash_holdout(root, payload, segs)
 
-    # 1. Governance files: the agent cannot rewrite its own gates or audit trail from the shell.
+    # 1. Governance files: the agent cannot rewrite its own gates or audit trail from the shell. Only a write
+    #    whose TARGET is a governance path counts: `python .sdlc/bin/x.py > /tmp/log` is fine.
     for seg in segs:
-        if HELPER_RE.match(seg):
+        targets = REDIRECT_RE.findall(seg)
+        bare = re.sub(r"^[\s(]*((nohup|exec|time|env)\s+|[A-Za-z_][A-Za-z0-9_]*=\S*\s+)*", "", seg)
+        if HELPER_RE.match(bare) and not any(GOV_RE.search(t) for t in targets):
             continue  # the helper CLI enforces its own human-only actions
-        if re.search(r"\.sdlc[/\\](config\.json|state|bin|audit\.jsonl)", seg) and WRITE_VERB_RE.search(seg):
+        if not GOV_RE.search(seg):
+            continue
+        verb = VERB_RE.search(seg)
+        after = seg[verb.end():] if verb else ""
+        if verb and (verb.group(2) or "").lower() in ("cp", "install", "ln"):
+            args = [t for t in tokens(after) if not t.startswith("-")]
+            after = args[-1] if args else ""  # copying FROM a governance file is fine; only the destination counts
+        if any(GOV_RE.search(t) for t in targets) or (verb and GOV_RE.search(after)):
             block(root, "This command would change .sdlc governance files (config/state/bin/audit). "
                         "A human does that by hand.", command=cmd)
 
@@ -254,7 +364,8 @@ def main() -> None:
     if not root:
         sys.exit(0)  # repo not initialised for the SDLC kit
     cfg = load_config(root)
-    {"pre-edit": pre_edit, "pre-bash": pre_bash, "post-edit": post_edit, "activity": activity}.get(
+    {"pre-edit": pre_edit, "pre-bash": pre_bash, "post-edit": post_edit, "activity": activity,
+     "pre-read": pre_read, "post-read": post_read}.get(
         mode, lambda *a: None)(root, cfg, payload)
     sys.exit(0)
 

@@ -26,6 +26,8 @@ Run `python3 -c "import os;print(os.environ.get('CLAUDE_CODE_EXPERIMENTAL_AGENT_
   restart Claude Code). If they want to go on without it, use **Background mode** at the end.
 
 ## 1. Preconditions
+- `python3 .sdlc/bin/doctor.py`: fix every ✗ first (it names the fix). ⚠ lines are worth fixing too: missing
+  permissions make every teammate command wait for a click.
 - `intent.md` is `Status: accepted`; prefer accepted `spec.md` + `plan.md`. Missing → offer `/sdlc:spec` / `/sdlc:plan`.
 - `team.qa.start_cmd` starts the app with `{port}` for browser QA; empty → QA uses tests and API calls (say so once).
 
@@ -33,9 +35,17 @@ Run `python3 -c "import os;print(os.environ.get('CLAUDE_CODE_EXPERIMENTAL_AGENT_
 ```bash
 python3 .sdlc/bin/team.py plan <change> [--developers N]
 ```
-Show the tree it prints (stories, tasks, who, what waits for the design). Gate with AskUserQuestion: "Start the team
+Show the tree it prints (stories, tasks, who, what waits for the design) and any **PLAN WARNINGS** (a dependency
+chain that would leave developers idle, tasks too big). With warnings, propose the fix to the user first: loosen the
+named dependencies (depend on an interface or API contract, not the whole feature), split the big tasks. Gate with AskUserQuestion: "Start the team
 on this breakdown?" — **Start (Recommended)** / **Change something** / **Stop**. On a change: edit
 `<change>/breakdown.json` with the user, then run `plan` again (it reloads while no work has started).
+
+**Mid-run plan fix.** While the team runs, `breakdown.json` can still be edited (same tasks, same order) and
+`plan <change>` run again: tasks still in To Do take the new dependencies and text; started work is left alone.
+
+**Slow run?** `python3 .sdlc/bin/why_slow.py` shows, per teammate, model time vs command time and the slowest
+commands. Fix what it names; don't guess.
 
 ## 3. Permissions (once per project)
 Teammates' permission prompts all land in this window and stall the team. Ask with AskUserQuestion: "Pre-approve the
@@ -75,7 +85,8 @@ python3 .sdlc/bin/team.py next <change> --done <that teammate's name>      # tim
 ```bash
 python3 .sdlc/bin/team.py watch <change>      # run_in_background: true
 ```
-It exits when handed-in work is waiting for an idle QA teammate (`work_waiting` → run `next <change>` without
+It exits when the supervisor (in `act` mode) has something for a teammate (`supervisor` → SendMessage each
+entry's `message` to its `to`; for `lead` entries run its `do`), when handed-in work is waiting for an idle QA teammate (`work_waiting` → run `next <change>` without
 `--done` and relay), or when a teammate is past its time budget (from `.sdlc/config.json`: `team.run_timeout_minutes` for developers,
 `team.qa.minutes_per_task` × tasks for QA), or after 30 minutes with an empty list. For each `over_budget` entry,
 SendMessage that teammate the entry's `message` — a time check, not a stop: it never cancels work. Then start the
@@ -83,7 +94,12 @@ watcher again. Tell the user in one line (`⏱ qa-1 is 12 min into T-12 (budget 
 is still silent long after that, look at its transcript; if it is truly stuck, ask it to shut down and run
 `next --done <name>` — its committed work is kept and the next assignment continues from it.
 
+**Away from the keyboard?** If `notify` is configured, start `python3 .sdlc/bin/notify.py serve` with
+run_in_background: true: designs, escalations and handovers reach the phone with buttons that act.
+
 ## 6. The human, only when `waiting_for_human` says so
+- **Permissions** (`what: permissions`): teammates' commands are waiting for clicks in this window, which makes the
+  team many times slower. Ask with AskUserQuestion as in step 3; on yes run `python3 .sdlc/bin/team.py allow`.
 - **Design approval** (`what: design approval`): give the user the `mockup` link, then AskUserQuestion "Approve the
   design?" — **Approve (Recommended)** / **Request changes** / **Stop**. Approve → `python3 .sdlc/bin/board.py
   design-approve D-1 "<their note>"`; changes → ask what, then `python3 .sdlc/bin/board.py design-changes D-1

@@ -33,5 +33,15 @@ jobs:
         run: python tests/test_rebalance.py
       - name: early QA (QA tests handed-in tasks while the developer finishes the story)
         run: python tests/test_early_qa.py
+      - name: out of the loop (pipeline, merge gate, trial/auto, revert)
+        run: python tests/test_outloop.py
+      - name: doctor
+        run: python tests/test_doctor.py
+      - name: holdouts, fence, deliberate bugs, check depth
+        run: python tests/test_phase2.py
+      - name: cost on the board, supervisor, phone buttons, parallel, manager, timer
+        run: python tests/test_phase3.py
+      - name: shell guard (writes into kit files blocked, logs elsewhere allowed)
+        run: python tests/test_hooks_shell.py
       - name: Jira / Linear sync
         run: python tests/test_trackers.py
