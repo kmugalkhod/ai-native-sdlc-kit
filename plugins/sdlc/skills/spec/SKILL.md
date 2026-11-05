@@ -11,6 +11,10 @@ disable-model-invocation: true
 
 Change: `$ARGUMENTS` (resolve to one folder under `sdlc/changes/`; if empty or ambiguous, run `python3 .sdlc/bin/sdlc.py status` and pick the single `design-ready` change, or ask).
 
+
+> If `sdlc/MISSION.md` is filled in, read it first. When the intent asks for something its **Never** list rules out,
+> say so in the spec's flagged concerns (`- [ ]`) instead of specifying it — a human decides.
+
 ## Preconditions
 - `intent.md` must be `Status: accepted`. If not, stop and say the product owner has to accept it first.
 - If `spec.md` already exists, revise it rather than starting over, and keep resolved concerns.

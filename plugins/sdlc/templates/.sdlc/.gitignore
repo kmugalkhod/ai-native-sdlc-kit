@@ -2,3 +2,4 @@ state/
 audit.jsonl
 __pycache__/
 worktrees/
+evidence/

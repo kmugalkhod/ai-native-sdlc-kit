@@ -134,7 +134,9 @@ whole run. You watch and talk to each of them in the agent panel.
 5. **QA by story** — when a story is handed over, the lead starts the app on a free port and a QA teammate checks
    every acceptance criterion (API + one real-browser pass), adds tests, and gives a verdict per task. A failure
    goes back to the same developer — who still has the context. Pure setup tasks (`"qa": "none"`) are verified by
-   the lead instead of a QA run.
+   the lead instead of a QA run. **A PASS needs proof:** `qa-pass <key> "..." --evidence <file> ...` must cite files
+   written during that check (a saved curl response, a test log, a screenshot); the board refuses a PASS without
+   fresh proof and keeps a hashed copy in `.sdlc/state/evidence/<key>/`.
 6. **Merge by story** — a fully passed story merges into `team/<change>` in one go; conflicts go back to the
    developer. `team.py wrap` runs the full verify on the team branch and commits `team-report.md`. Nothing is pushed
    to main.
@@ -254,6 +256,64 @@ python3 .sdlc/bin/monitor.py --dry-run                         # sample band bre
 python3 .sdlc/bin/evals.py --case verify-before-done
 ```
 Exit code 3 = escalated (see `ESCALATION.md`). The intent must already be accepted by a human; nothing passes the production gate.
+
+### Merge decisions: facts first, then the agent's confidence
+
+After review, the agent writes `assessment.json`: is it confident it built what the intent asks, which assumptions
+it made, and why not if it isn't. `merge_gate.py` then decides, per change:
+
+- **Hard limits (facts):** the exact commit is verified (the log is kept as evidence), it merges without conflicts,
+  no Important review finding is open, no protected or governance path is touched (`.sdlc/config.json`,
+  `.claude/settings.json`, CI files, `CLAUDE.md` …). Any one of them hands the change to a human.
+- **Confidence:** "not confident", or no assessment at all, always goes to a human.
+
+`pipeline.merge_mode` in `.sdlc/config.json` (or `loop.py --merge-mode`):
+
+| mode | what happens |
+|---|---|
+| `off` | nothing evaluated: the branch / PR waits for you, as before |
+| `trial` *(default)* | every decision is evaluated and recorded (`would merge` / `would hand over`), nothing is merged |
+| `auto` | a change that clears everything is merged; main is verified right after, and the merge is reverted if it turns red |
+
+Run on `trial` for a while, read the decisions (`python3 .sdlc/bin/merge_gate.py show`), then switch to `auto`.
+With `--pr`, auto mode merges through the PR (`gh pr merge --match-head-commit`, or `glab`), so the merge is pinned to
+the verified commit.
+
+### Proving the checks: hidden holdouts, deliberate bugs, check depth
+
+- **Hidden holdout scenarios.** Before the spec is written, the `holdout-writer` agent writes 3–6 scenarios from
+  `intent.md` alone into `sdlc/holdout/<change>.md`: an exam no builder sees. The hooks refuse every other agent
+  any Read, Grep, Glob, write or shell command that would show them (git output is checked first), `.ignore` keeps
+  ripgrep out, and any scenario text that still shows up in a tool's output is counted. Before a merge, the
+  `holdout-verifier` runs them against the running app (`holdout.start_cmd`, else `team.qa.start_cmd`) and returns
+  only a verdict and what a user saw. A failed scenario — or one a builder has seen — hands the change over.
+- **Deliberate bugs** (`sdlc/defects.json`, human-owned): `python3 .sdlc/bin/mutate.py` injects each one, runs
+  `verify.test` and restores the file. Every one must turn the tests red; one that **ESCAPED** is a kind of bug that
+  could merge unnoticed.
+- **Check depth.** `light` (docs, config, internal), `normal`, `deep` (auth, permissions, money, personal data,
+  migrations — or `Check: deep` in `intent.md`). Light skips holdouts; deep also runs the deliberate bugs before a
+  merge. In team mode the planner sets `"check"` per task, and QA's instructions and time budget follow it.
+- **Mission.** `sdlc/MISSION.md` (human-owned) says what the product is and what it must **never** become. The spec
+  flags and the gatekeeper escalates a request that drifts outside it.
+
+### Running for days
+
+| | command | what it does |
+|---|---|---|
+| **Timer** | `schedule.py install [--every 5] --apply` | systemd user timer (Linux), launchd (macOS) or Task Scheduler (Windows) running `schedule.py fire`: one `loop.py --once` tick, the manager when it's due. Secrets in `~/.sdlc-env`. `halt` / `unhalt` stop and allow ticks. A tick never overlaps the previous one. |
+| **Parallel** | `loop.py --parallel 3` | several changes at once, each in its own worktree and branch, claimed so no two runners take the same change; merges into main stay one at a time under a lock. |
+| **Manager** | `manager.py --fix` | every few hours: loop not running, crashed runs (retried once, then reported), what waits for you, nothing merged for hours, a failed revert, stuck teammates, stale locks. |
+| **Supervisor** | `supervisor.py` (also inside `team.py watch`) | reads every teammate's live session: the same command failing 3×, the same file read 4×, tooling fights, "done but never told the lead", no activity. `team.supervisor.mode`: `trial` (default, notes on the board what it would say) or `act` (the lead relays it). `team.supervisor.model: "haiku"` lets a model write the hint. |
+| **Phone** | `notify.py serve` | Telegram messages with buttons — Approve / Request changes (a design), Answer (an escalated task: your reply resumes it), Merge anyway (a handed-over change: only the agent's doubt is overruled, hard limits still apply) — and Slack alerts. Only your chat is obeyed. Secrets in env vars only. |
+| **Reply on the issue** | Jira / Linear sync | an escalated task posts its question on the issue; your reply there resumes it with that guidance. |
+| **Cost** | live board, `cost_report.py` | API-equivalent cost of the run in the header, per teammate and on every card, from Claude Code's own session records — also on a subscription. |
+
+### doctor
+
+`python3 .sdlc/bin/doctor.py` checks the setup before a run: git and its identity, the config, the tools your verify
+commands need, the kit scripts, ignored folders, the `claude` CLI, Agent Teams, teammate permissions, stale git locks
+(left by a crash or power cut), stale worktrees, the board database, the working tree and disk space. Each problem
+comes with its fix; `--fix` does the safe ones. `loop.py` runs it first and refuses to start on a real problem.
 
 ## Models
 

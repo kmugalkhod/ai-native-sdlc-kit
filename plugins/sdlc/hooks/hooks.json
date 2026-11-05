@@ -21,6 +21,16 @@
             "timeout": 20
           }
         ]
+      },
+      {
+        "matcher": "Read|Grep|Glob|NotebookRead",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "bash \"${CLAUDE_PLUGIN_ROOT}/hooks/run.sh\" pre-read",
+            "timeout": 20
+          }
+        ]
       }
     ],
     "PostToolUse": [
@@ -41,6 +51,16 @@
             "type": "command",
             "command": "bash \"${CLAUDE_PLUGIN_ROOT}/hooks/run.sh\" activity",
             "timeout": 10
+          }
+        ]
+      },
+      {
+        "matcher": "Bash|Read|Grep|Glob",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "bash \"${CLAUDE_PLUGIN_ROOT}/hooks/run.sh\" post-read",
+            "timeout": 20
           }
         ]
       }

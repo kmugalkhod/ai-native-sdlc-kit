@@ -1,0 +1,2 @@
+# Grep and Glob (ripgrep) skip these: hidden holdout scenarios are for the holdout agents only
+sdlc/holdout/
