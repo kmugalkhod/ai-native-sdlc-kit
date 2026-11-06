@@ -32,7 +32,7 @@ PRICES = {
 }
 HAIKU_LONG = 100_000  # Haiku 5.5: prompts over this many tokens (incl. cache) pay the long rate
 NAME = re.compile(r"assignments[\\/]+((?:dev|qa)-\d+|designer)-|\byou are ((?:dev|qa)-\d+|designer|the designer|"
-                  r"the planner|the independent gate)\b", re.I)
+                  r"the planner|the architect|architect|the team lead|the independent gate)\b", re.I)
 # which cards a session is working on: an agent-team assignment, or the one task of a background-mode session
 KEYS = [re.compile(r"New assignment \(([^)]*)\)"), re.compile(r"YOUR TASK ((?:T|D)-\d+)"),
         re.compile(r"handed you task ((?:T|D)-\d+)"), re.compile(r"BLOCKED on task ((?:T|D)-\d+)"),

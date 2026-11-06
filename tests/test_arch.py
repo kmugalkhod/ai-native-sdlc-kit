@@ -1,5 +1,5 @@
 """Architecture step: the Mermaid → draw.io export is faithful, and nothing is planned against an architecture a
-human has not approved (headless pipeline escalates, team prepare refuses). python tests/test_arch.py
+human has not approved (headless pipeline escalates, team prepare waits for the human). python tests/test_arch.py
 """
 import subprocess
 import sys
@@ -131,7 +131,9 @@ def approval(root, arch):
           and "ARCHITECTURE.md" in esc.read_text(encoding="utf-8"), r.stdout[-400:] + r.stderr[-400:])
     r = subprocess.run([sys.executable, str(root / ".sdlc/bin/team.py"), "prepare", "trace-app"], cwd=root,
                        capture_output=True, text=True, env={**os.environ, **env_fake})
-    check("team prepare refuses", r.returncode != 0 and "ARCHITECTURE.md" in r.stderr, r.stderr[-300:])
+    plan_made = (change / "breakdown.json").exists()
+    check("team prepare waits for the human, plans nothing", r.returncode == 0 and '"architecture approval"' in r.stdout
+          and not plan_made, r.stdout[-300:] + r.stderr[-300:])
     arch.write_text(DIAGRAM.replace("Status: proposed", "Status: approved\nApproved by: t"), encoding="utf-8")
     check("approved architecture lets planning run", architecture_problem(root) is None)
     arch.unlink()

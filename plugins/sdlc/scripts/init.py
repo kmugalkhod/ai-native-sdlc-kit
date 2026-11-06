@@ -20,7 +20,8 @@ PLUGIN = Path(__file__).resolve().parent.parent
 TEMPLATES = PLUGIN / "templates"
 BIN_FILES = ["sdlc_core.py", "sdlc.py", "pipeline.py", "evals.py", "monitor.py", "loop.py",
              "board.py", "team.py", "trackers.py", "board_server.py", "why_slow.py", "merge_gate.py", "doctor.py", "cost_report.py",
-             "mutate.py", "notify.py", "supervisor.py", "manager.py", "schedule.py", "arch_export.py"]
+             "mutate.py", "notify.py", "supervisor.py", "manager.py", "schedule.py", "arch_export.py",
+             "review.py", "review_page.py"]
 CI_FILES = {
     "github": [".github/workflows/agent-evals.yml", ".github/workflows/claude-review.yml",
                ".github/workflows/sdlc-loop.yml", ".github/workflows/sdlc-monitor.yml"],

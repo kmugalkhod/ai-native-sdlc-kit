@@ -98,6 +98,18 @@ is still silent long after that, look at its transcript; if it is truly stuck, a
 run_in_background: true: designs, escalations and handovers reach the phone with buttons that act.
 
 ## 6. The human, only when `waiting_for_human` says so
+- **Architecture approval** (`what: architecture approval`, card A-1): `prepare` ran the architect (Opus) before the
+  planner, and nothing is planned yet.
+  1. Show the user `files` (`sdlc/architecture.png`, `sdlc/ARCHITECTURE.md`, the editable `.drawio`) and `decisions`.
+  2. Ask each item in `open_questions` with AskUserQuestion, and record the answers with `architecture-changes`.
+  3. Ask "Approve this architecture?": **Approve (Recommended)** / **Request changes** / **Stop**.
+     - Approve: run `python3 .sdlc/bin/team.py architecture-approve <change> "<their note>"`.
+     - Changes: ask what to change, then run `python3 .sdlc/bin/team.py architecture-changes <change> "<their words>"`.
+  4. Then run **`prepare` again**: it revises the architecture or plans against the approved one.
+
+  Run these commands only after the user has chosen. Never approve the architecture yourself.
+  Also tell the user they can read it and ask the architect questions in the board's **Review** tab
+  (`http://127.0.0.1:<board_port>/#review`), and approve there. If `prepare` shows it approved, carry on.
 - **Permissions** (`what: permissions`): teammates' commands are waiting for clicks in this window, which makes the
   team many times slower. Ask with AskUserQuestion as in step 3; on yes run `python3 .sdlc/bin/team.py allow`.
 - **Design approval** (`what: design approval`): give the user the `mockup` link, then AskUserQuestion "Approve the

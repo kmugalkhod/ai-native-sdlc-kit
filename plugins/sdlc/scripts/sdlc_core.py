@@ -57,7 +57,8 @@ DEFAULTS: dict = {
     "team": {
         "developers": 2, "qa_agents": 1,
         "models": {"planner": "sonnet", "developer": "sonnet", "qa": "sonnet", "helper": "sonnet",
-                   "designer": "sonnet"},
+                   "designer": "sonnet", "architect": "opus"},
+        "architect": {"mode": "auto", "timeout_minutes": 30},  # auto: before the first plan of a change | off
         "max_qa_rounds": 3, "max_dev_attempts": 2, "max_help_rounds": 2, "run_timeout_minutes": 40,
         "stall_minutes": 12, "plan_max_files": 10, "supervisor": {"mode": "trial", "model": ""},
         "branch_prefix": "team/", "worktree_dir": ".sdlc/worktrees",

@@ -114,6 +114,14 @@ A human always approves it, even with `--auto`. After that:
 
 Small changes skip the step.
 
+Team runs (`/sdlc:team`, `team.py run`) do the same. Before the first plan of a change, the architect runs and the
+team waits for you. In Agent Teams mode the lead asks you; in background mode the run waits until you decide:
+- approve: `python .sdlc/bin/team.py architecture-approve <change> "note"`
+- ask for changes: `python .sdlc/bin/team.py architecture-changes <change> "what to change"`
+
+Set `team.architect.mode` to `off` to skip the architect, and `team.models.architect` to choose its model (default
+`opus`).
+
 ## Playbook → kit
 
 | Stage / play | Kit |
@@ -207,6 +215,15 @@ the designer. Install impeccable once: `/plugin marketplace add pbakaus/impeccab
 **The board page:** kanban (To Do · In Progress · Blocked · In QA · Done) with live "who is doing what" on each
 card, epic/story/task tree with progress, search across everything, filters by story and agent, task detail with
 full history, the team's chat and activity feed, and a box to message the agents.
+
+**The Review tab** (same page, badge = what waits for you): every document the team wrote for the change —
+architecture, ADRs, intent, spec, plan, designs, escalations — rendered on the left with its git versions (lines a
+version added are highlighted), and a chat on the right with the agent that wrote it. Select text to quote it in a
+question. The agent answers in its own resumed session (the architect on Opus). While the architecture is still
+proposed, the architect can revise it from the chat; accepted documents are questions only. The **Approve / Request
+changes / Resume** buttons there run the same commands as above (`architecture-approve`, `design-approve`,
+`resume`), so the running team picks the decision up. Clicking a waiting card, the "needs you" pill or a banner opens
+it. Everything agents write is shown as escaped text: no agent can put script on the page.
 
 **Configure per project** (`.sdlc/config.json`, human-owned):
 
@@ -357,7 +374,7 @@ plugins/sdlc/
                developer qa holdout-writer holdout-verifier
   hooks/       hooks.json run.sh
   scripts/     sdlc_core.py sdlc_hooks.py sdlc.py pipeline.py loop.py evals.py monitor.py init.py
-               team.py board.py board_server.py trackers.py arch_export.py merge_gate.py doctor.py ...
+               team.py board.py board_server.py review.py trackers.py arch_export.py merge_gate.py doctor.py ...
   templates/   CLAUDE.md REVIEW.md .sdlc/ sdlc/ evals/ .claude/ .github/ .gitlab/ examples/
 ```
 

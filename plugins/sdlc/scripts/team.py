@@ -124,7 +124,8 @@ class AgentRun:
                  add_dirs: list[str] | None = None, plugin_dir: str | list | None = None, stall_min: float = 12):
         self.b, self.name, self.cwd, self.item_key = board, name, cwd, item_key
         self.prompt = prompt
-        self.cmd = ["claude", "-p", "--model", model, "--output-format", "stream-json", "--verbose",
+        self.cmd = [*(json.loads(os.environ["SDLC_CLAUDE_CMD"]) if os.environ.get("SDLC_CLAUDE_CMD") else ["claude"]),
+                    "-p", "--model", model, "--output-format", "stream-json", "--verbose",
                     "--permission-mode", "acceptEdits", "--allowedTools", *tools,
                     "--disallowedTools", "Bash(git push*)"]
         if mcp:
@@ -178,7 +179,7 @@ class AgentRun:
                 kill_tree(self.proc)
                 return
         try:
-            exe = shutil.which(self.cmd[0]) or self.cmd[0]
+            exe = shutil.which(self.cmd[0]) or self.cmd[0]  # the stand-in may be a list: [python, script]
             with open(err_path, "w", encoding="utf-8", errors="replace") as err:
                 self.proc = subprocess.Popen([exe, *self.cmd[1:]], cwd=self.cwd, env=self.env, stdin=subprocess.PIPE,
                                              stdout=subprocess.PIPE, stderr=err, text=True, encoding="utf-8",
@@ -322,15 +323,176 @@ Do not write any files. Reply with ONLY the breakdown as one JSON object in a ``
 """
 
 
-def cmd_plan(root: Path, cfg: dict, a) -> None:
+ARCH_FALLBACK = """Design or update the system architecture for the change at {rel}, before anyone plans it. Read its
+intent.md and spec.md, sdlc/MISSION.md, CLAUDE.md, README.md, the dependency manifests and any existing
+sdlc/ARCHITECTURE.md and sdlc/adr/. Write sdlc/ARCHITECTURE.md (header lines Status: proposed, Change: {rel}, Updated:
+today; sections Context, Diagram as one ```mermaid flowchart, Components, Data, Key flows, Quality attributes, Security,
+Configuration, Decisions, Open questions, Out of scope) and one sdlc/adr/NNNN-<slug>.md per hard choice (Status,
+Context, Options considered with trade-offs, Decision, Consequences, Revisit when). Then run
+`python3 .sdlc/bin/arch_export.py` and look at sdlc/architecture.png; simplify the diagram if it is hard to read.
+If the change needs no architectural change, edit nothing and reply `NO ARCHITECTURE CHANGE: <why>`.
+Never set Status: approved and never write application code."""
+
+
+def arch_prompt(rel: str, feedback: list) -> str:
+    """The architect agent's own instructions (agents/architect.md) when the plugin is at hand, else the summary."""
+    body = ""
+    for d in (os.environ.get("SDLC_PLUGIN_DIR"), os.environ.get("CLAUDE_PLUGIN_ROOT"), str(Path(__file__).resolve().parents[1])):
+        f = Path(d or "") / "agents" / "architect.md"
+        if d and f.is_file():
+            body = re.sub(r"^---.*?---\s*", "", f.read_text(encoding="utf-8"), flags=re.S)
+            break
+    text = (f"You are the architect on an AI-native SDLC agent team. The change folder is {rel}.\n\n"
+            + (body or ARCH_FALLBACK.format(rel=rel)))
+    if feedback:
+        text += ("\n\nThe human reviewed your proposed sdlc/ARCHITECTURE.md and asked for these changes. Apply them, "
+                 "keep Status: proposed, and export the diagram again:\n" + "\n".join(f"- {x}" for x in feedback))
+    return text
+
+
+def arch_state(root: Path, change: Path) -> tuple[Path, dict]:
+    f = root / ".sdlc" / "state" / "architecture" / f"{change.name}.json"
+    try:
+        return f, json.loads(f.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return f, {}
+
+
+def arch_wait(root: Path, change: Path) -> dict:
+    rel = lambda p: p.relative_to(root).as_posix()
+    doc = root / "sdlc" / "ARCHITECTURE.md"
+    files = [rel(p) for p in (doc, root / "sdlc" / "architecture.png", root / "sdlc" / "architecture.svg",
+                              root / "sdlc" / "architecture.drawio") if p.is_file()]
+    text = doc.read_text(encoding="utf-8") if doc.is_file() else ""
+    m = re.search(r"^##\s*Decisions\s*\n(.*?)(?=^##\s|\Z)", text, re.S | re.M)
+    q = re.search(r"^##\s*Open questions\s*\n(.*?)(?=^##\s|\Z)", text, re.S | re.M)
+    return {"what": "architecture approval", "key": "A-1", "files": files,
+            "decisions": (m.group(1).strip()[:900] if m else ""),
+            "open_questions": [l.strip()[5:].strip() for l in (q.group(1) if q else "").splitlines()
+                               if l.strip().startswith("- [ ]")],
+            "approve": f'python3 .sdlc/bin/team.py architecture-approve {change.name} "<their note>"',
+            "changes": f'python3 .sdlc/bin/team.py architecture-changes {change.name} "<their words>"'}
+
+
+def architecture_gate(root: Path, cfg: dict, change: Path, a) -> dict | None:
+    """Before the first plan of a change: the architect designs (or checks) the system, a human approves it.
+    Returns None when planning may go ahead, else what the human has to decide."""
+    acfg = cfg["team"].get("architect") or {}
+    if acfg.get("mode", "auto") == "off" or (getattr(a, "simulate", False) and not os.environ.get("SDLC_CLAUDE_CMD")):
+        if problem := architecture_problem(root):  # no architect here, but never plan against an unapproved one
+            sys.exit(problem)
+        return None
+    sf, st = arch_state(root, change)
+    doc = root / "sdlc" / "ARCHITECTURE.md"
+    status = (header_field(doc, "Status") or "").lower()
+    if st.get("result") == "unchanged" and not st.get("feedback_pending"):
+        return None
+    if status in ("approved", "accepted") and not st.get("feedback_pending") and st.get("result") in ("approved", "proposed"):
+        return None  # approved (by architecture-approve, or by hand in the file)
+    if status == "proposed" and not st.get("feedback_pending"):
+        return arch_wait(root, change)  # still waiting for the human (also one proposed by /sdlc:architect)
+    rel = change.relative_to(root).as_posix()
+    b = Board()
+    b.upsert_agent("architect", role="architect", status="working", activity="designing the system")
+    b.event(None, "architect", "activity", f"architecture for {change.name}: designing before planning")
+    log("architect: designing the system before the plan")
+    tools = BASE_TOOLS + EDIT_TOOLS + ["Bash(python3 .sdlc/bin/arch_export.py*)", "Bash(python .sdlc/bin/arch_export.py*)",
+                                       "Bash(ls*)", "Bash(mkdir *)", "Bash(cat *)", "Bash(git log*)"]
+    r = AgentRun(b, "architect", root, arch_prompt(rel, (st.get("feedback") or []) if st.get("feedback_pending") else []),
+                 cfg["team"]["models"].get("architect", "opus"), tools, None, int(acfg.get("timeout_minutes", 30)),
+                 plugin_dir=os.environ.get("SDLC_PLUGIN_DIR"))
+    r.run()
+    st["runs"] = st.get("runs", 0) + 1
+    st["feedback_pending"] = False
+    sf.parent.mkdir(parents=True, exist_ok=True)
+    if "NO ARCHITECTURE CHANGE" in (r.result_text or ""):
+        st["result"], st["why"] = "unchanged", r.result_text.split("NO ARCHITECTURE CHANGE", 1)[1].strip(" :")[:300]
+        sf.write_text(json.dumps(st, indent=2), encoding="utf-8")
+        b.upsert_agent("architect", status="idle", activity="architecture unchanged")
+        log(f"architect: no architectural change ({st['why'][:120]})")
+        return None
+    if not doc.is_file():
+        b.upsert_agent("architect", status="idle", activity="failed: no ARCHITECTURE.md")
+        sys.exit(f"the architect wrote no sdlc/ARCHITECTURE.md ({r.error or (r.result_text or '')[-300:]})")
+    text = doc.read_text(encoding="utf-8")
+    if (header_field(doc, "Status") or "").lower() != "proposed":  # only a human approves
+        text = re.sub(r"(?mi)^(\W*Status:\s*)\S+.*$", r"\1proposed", text, count=1) if re.search(
+            r"(?mi)^\W*Status:", text) else "Status: proposed\n\n" + text
+        doc.write_text(text, encoding="utf-8")
+    if not (root / "sdlc" / "architecture.drawio").is_file():
+        subprocess.run([sys.executable, str(root / ".sdlc" / "bin" / "arch_export.py"), str(doc)], cwd=root,
+                       capture_output=True, text=True)
+    st["result"] = "proposed"
+    sf.write_text(json.dumps(st, indent=2), encoding="utf-8")
+    b.upsert_agent("architect", status="idle", activity="waiting for your approval of the architecture")
+    b.event(None, "architect", "design", "architecture proposed: sdlc/ARCHITECTURE.md + sdlc/architecture.png — "
+            "waiting for a human to approve before planning")
+    audit(root, "architecture-proposed", change=change.name)
+    w = arch_wait(root, change)
+    try:
+        import notify
+        notify.send(root, cfg, "needs_you", "🏛 Architecture is ready for you",
+                    f"{change.name}\n{w['decisions'][:600]}\nFiles: {', '.join(w['files'])}", [], f"arch-{change.name}")
+    except Exception:
+        pass
+    return w
+
+
+def cmd_architecture_approve(root: Path, cfg: dict, a) -> None:
+    """The human's decision: the proposed architecture is approved; planning may start."""
+    change = resolve_change(root, cfg, a.change)
+    doc = root / "sdlc" / "ARCHITECTURE.md"
+    if (header_field(doc, "Status") or "").lower() != "proposed":
+        sys.exit("sdlc/ARCHITECTURE.md is not waiting for approval (Status is not proposed)")
+    who = a.by or (git(root, "config", "user.name") or "").strip() or "human"
+    text = doc.read_text(encoding="utf-8")
+    text = re.sub(r"(?mi)^(\W*Status:\s*)proposed\b.*$", r"\1approved", text, count=1)
+    stamp = f"Approved by: {who}  \nApproved for: {change.name}  \nApproved on: {time.strftime('%Y-%m-%d')}"
+    text = re.sub(r"(?mi)^(\W*Status:\s*approved.*)$", lambda m: m.group(1) + "  \n" + stamp, text, count=1)
+    if a.note:
+        text = text.rstrip() + f"\n\n## Approval note\n\n{a.note}\n"
+    doc.write_text(text, encoding="utf-8")
+    for adr in sorted((root / "sdlc" / "adr").glob("*.md")):
+        t = adr.read_text(encoding="utf-8")
+        if re.search(r"(?mi)^\W*Status:\s*proposed", t):
+            adr.write_text(re.sub(r"(?mi)^(\W*Status:\s*)proposed", r"\1accepted", t, count=1), encoding="utf-8")
+    sf, st = arch_state(root, change)
+    st.update(result="approved", approved_by=who)
+    sf.parent.mkdir(parents=True, exist_ok=True)
+    sf.write_text(json.dumps(st, indent=2), encoding="utf-8")
+    Board().event(None, "human", "design", f"architecture approved by {who}" + (f": {a.note}" if a.note else ""))
+    audit(root, "architecture-approved", change=change.name, by=who)
+    if cfg["pipeline"].get("commit", True):
+        paths = [p for p in ("sdlc/ARCHITECTURE.md", "sdlc/adr", "sdlc/architecture.png", "sdlc/architecture.svg",
+                             "sdlc/architecture.drawio") if (root / p).exists()]
+        git(root, "add", *paths)
+        git(root, "commit", "-q", "-m", f"architecture: {change.name}", "-m", f"Approved by {who}.")
+    print(f"architecture approved by {who}; planning can start (run prepare / plan / run again)")
+
+
+def cmd_architecture_changes(root: Path, cfg: dict, a) -> None:
+    """The human asks for changes: the architect runs again with this feedback before anything is planned."""
+    change = resolve_change(root, cfg, a.change)
+    sf, st = arch_state(root, change)
+    st.setdefault("feedback", []).append(a.text)
+    st["feedback_pending"] = True
+    sf.parent.mkdir(parents=True, exist_ok=True)
+    sf.write_text(json.dumps(st, indent=2), encoding="utf-8")
+    Board().event(None, "human", "design", f"architecture changes requested: {a.text}")
+    print("noted; the architect revises it on the next prepare / plan / run")
+
+
+def cmd_plan(root: Path, cfg: dict, a) -> dict | None:
     change = resolve_change(root, cfg, a.change)
     rel = change.relative_to(root).as_posix()
     if (header_field(change / "intent.md", "Status") or "") not in ("accepted", "approved"):
         sys.exit("intent.md must be Status: accepted before the team plans it")
-    if problem := architecture_problem(root):
-        sys.exit(problem)
     out = change / "breakdown.json"
     if not out.is_file() or a.replan:
+        if wait := architecture_gate(root, cfg, change, a):
+            print(f"\nARCHITECTURE WAITING FOR A HUMAN — review {', '.join(wait['files'])}, then:\n"
+                  f"  approve:  {wait['approve']}\n  changes:  {wait['changes']}")
+            return wait
         if a.simulate:
             out.write_text(json.dumps(SIM_BREAKDOWN, indent=2), encoding="utf-8")
         else:
@@ -2265,7 +2427,11 @@ def cmd_prepare(root: Path, cfg: dict, a) -> None:
         clear_stale_git_locks(root)
     change = resolve_change(root, cfg, a.change)
     with contextlib.redirect_stdout(sys.stderr):  # stdout carries only the JSON for the session lead
-        cmd_plan(root, cfg, a)
+        wait = cmd_plan(root, cfg, a)
+    if wait:  # nothing is planned until a human approves the architecture
+        print(json.dumps({"assignments": [], "waiting_for_human": [wait], "working": [], "progress": "0/0",
+                          "finished": False, "board": "architecture first"}, indent=2))
+        return
     lead = TeamLead(root, cfg, change, a, session_start=True)
     lead.setup_session()
     out = lead.step()
@@ -2419,7 +2585,15 @@ def cmd_run(root: Path, cfg: dict, a) -> None:
     b = Board()
     if not b.items(type_="task"):
         log("board is empty — planning first")
-    cmd_plan(root, cfg, a)  # plans if needed; reloads an edited breakdown.json while no work has started
+    wait = cmd_plan(root, cfg, a)  # plans if needed; reloads an edited breakdown.json while no work has started
+    limit = time.time() + 60 * cfg["team"]["design"].get("approval_timeout_minutes", 240)
+    while wait:  # background mode: the human approves (or asks for changes) from a terminal, then the run goes on
+        if time.time() > limit:
+            sys.exit("architecture still waiting for approval; run again after you decide")
+        time.sleep(10)
+        sf, st = arch_state(root, change)
+        if st.get("feedback_pending") or (header_field(root / "sdlc" / "ARCHITECTURE.md", "Status") or "").lower() != "proposed":
+            wait = cmd_plan(root, cfg, a)
     if b.meta().get("change") != change.name:
         sys.exit(f"the board holds {b.meta().get('change')}; run team.py reset first")
     if not shutil.which("claude") and not a.simulate:
@@ -2468,6 +2642,10 @@ def main() -> None:
         s.add_argument("--done", nargs="*", default=[], help="teammates that reported done (or stopped)")
         s.add_argument("--simulate", action="store_true")
         s.add_argument("--auto-approve-design", action="store_true")
+    s = sub.add_parser("architecture-approve", help="human: approve the proposed sdlc/ARCHITECTURE.md")
+    s.add_argument("change"); s.add_argument("note", nargs="?", default=""); s.add_argument("--by", default="")
+    s = sub.add_parser("architecture-changes", help="human: ask the architect to revise it")
+    s.add_argument("change"); s.add_argument("text")
     s = sub.add_parser("watch")
     s.add_argument("change", nargs="?")
     s.add_argument("--grace", type=float, default=1.0, help="report at budget × grace")
@@ -2482,7 +2660,8 @@ def main() -> None:
         sys.exit("not an SDLC repo: run /sdlc:init first")
     cfg = load_config(root)
     {"plan": cmd_plan, "run": cmd_run, "status": cmd_status, "reset": cmd_reset, "prepare": cmd_prepare,
-     "next": cmd_next, "wrap": cmd_wrap, "allow": cmd_allow, "watch": cmd_watch}[a.cmd](root, cfg, a)
+     "next": cmd_next, "wrap": cmd_wrap, "allow": cmd_allow, "watch": cmd_watch,
+     "architecture-approve": cmd_architecture_approve, "architecture-changes": cmd_architecture_changes}[a.cmd](root, cfg, a)
 
 
 if __name__ == "__main__":

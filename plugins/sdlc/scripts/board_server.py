@@ -22,6 +22,8 @@ from urllib.parse import parse_qs, urlparse
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 from board import Board  # noqa: E402
+from review import Review  # noqa: E402
+from review_page import REVIEW_PAGE  # noqa: E402
 
 PAGE = r"""<!doctype html>
 <html lang="en">
@@ -73,6 +75,15 @@ h1{margin:0;font-size:15px;font-weight:700;letter-spacing:-.01em;white-space:now
 .pill b{color:var(--text);font-weight:600}
 .pill.alert{color:var(--pink);border-color:color-mix(in srgb,var(--pink) 45%,var(--line));background:color-mix(in srgb,var(--pink) 10%,var(--panel2));cursor:pointer}
 .dot{width:8px;height:8px;border-radius:50%;background:var(--faint);flex:none}
+.tabs{display:flex;gap:2px;padding:2px;border-radius:10px;border:1px solid var(--line);background:var(--panel2);flex:none}
+.tab{display:inline-flex;align-items:center;gap:7px;height:28px;padding:0 13px;border:0;border-radius:8px;background:none;color:var(--muted);
+  font:600 12.5px/1 inherit;cursor:pointer}
+.tab:hover{color:var(--text)} .tab[aria-selected="true"]{background:var(--panel);color:var(--text);box-shadow:0 1px 2px rgba(0,0,0,.25),inset 0 0 0 1px var(--line)}
+.tab .cnt{min-width:18px;height:18px;padding:0 5px;border-radius:99px;background:var(--pink);color:#fff;font-size:10.5px;font-weight:800;
+  display:inline-grid;place-items:center}
+#reviewView{flex:1;min-height:0;width:100%;border:0;display:block;background:var(--bg)}
+#reviewView[hidden]{display:none}
+body.rv #banner,body.rv #now,body.rv .shell,body.rv .search{display:none}
 .dot.running,.dot.working{background:var(--green);animation:pulse 1.4s infinite}
 .dot.helping{background:var(--violet);animation:pulse 1.4s infinite}
 .dot.designing{background:var(--pink);animation:pulse 1.4s infinite}
@@ -270,6 +281,9 @@ pre.desc{white-space:pre-wrap;margin:0;font:inherit;color:var(--muted)}
   <div class="brand"><div class="logo" aria-hidden="true">
     <svg width="17" height="17" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.6" stroke-linecap="round" stroke-linejoin="round"><path d="M4 12.5 9.5 18 20 6.5"/></svg></div>
     <div style="min-width:0"><h1 id="title">Team Board</h1><div class="sub" id="subtitle">loading…</div></div></div>
+  <nav class="tabs" role="tablist" aria-label="Board or review">
+    <button class="tab" role="tab" data-tab="board" aria-selected="true">Board</button>
+    <button class="tab" role="tab" data-tab="review" aria-selected="false">Review <span class="cnt" id="rvcount" hidden></span></button></nav>
   <div class="pills">
     <span class="pill"><span class="dot" id="rundot"></span><b id="runstate">—</b></span>
     <span class="pill">tracker <b id="tracker">internal</b></span>
@@ -286,6 +300,7 @@ pre.desc{white-space:pre-wrap;margin:0;font:inherit;color:var(--muted)}
 </header>
 <div id="banner"></div>
 <div id="now" class="now" aria-live="polite"></div>
+<iframe id="reviewView" title="Review room" hidden></iframe>
 <div class="shell">
   <aside class="pane side" aria-label="Epics and stories">
     <div class="ph">Epics &amp; stories <span class="n" id="sidecount"></span></div>
@@ -328,7 +343,7 @@ const COLS=[["todo","To Do","var(--muted)"],["in_progress","In Progress","var(--
 const LABEL=Object.assign(Object.fromEntries(COLS.map(c=>[c[0],c[1]])),{in_qa:"In QA",review:"Needs approval"});
 const COLOF=st=>st==="review"?"in_qa":st;
 const STORY_COLORS=["var(--violet)","var(--teal)","var(--amber)","var(--blue)","var(--pink)","var(--green)","var(--red)"];
-let S={items:[],agents:[],events:[],messages:[],meta:{},progress:{},live:{},cost:{},now:0},since=0,view="board",openKey=null,fstory="",lastSig="";
+let S={review:{},items:[],agents:[],events:[],messages:[],meta:{},progress:{},live:{},cost:{},now:0},since=0,view="board",openKey=null,fstory="",lastSig="";
 const closedEpics=new Set(),closedGroups=new Set();
 const $=id=>document.getElementById(id);
 const esc=s=>String(s??"").replace(/[&<>"']/g,c=>({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;","'":"&#39;"}[c]));
@@ -394,14 +409,20 @@ function renderHeader(){const m=S.meta,ts=items("task"),d=ts.filter(t=>t.status=
   $("runstate").textContent=m.status||"idle";$("rundot").className="dot "+(m.status||"");
   $("tracker").textContent=m.tracker||"internal";$("branch").textContent=m.integration_branch||"—";
   $("progtxt").textContent=`${d}/${ts.length}`;$("progbar").style.width=(ts.length?100*d/ts.length:0)+"%";
-  const esc_=(m.escalated||[]).length,rev=S.items.filter(i=>i.type==="design"&&i.status==="review").length,n=esc_+rev;
+  const esc_=(m.escalated||[]).length,rev=S.items.filter(i=>i.type==="design"&&i.status==="review").length,n=S.review.count??(esc_+rev);
+  $("rvcount").hidden=!n;$("rvcount").textContent=n;
   $("needs").hidden=!n;$("needs").textContent=n?`● ${n} need${n===1?"s":""} you`:"";document.title=(n?`(${n}) `:"")+"Team Board"}
-function renderBanner(){const d=S.items.find(i=>i.type==="design"&&i.status==="review");
+function renderBanner(){const d=S.items.find(i=>i.type==="design"&&i.status==="review"&&!String(i.qa_by||"").startsWith("approved"));
+  const fa=S.review.first||"";
+  if(!d&&fa==="file:sdlc/ARCHITECTURE.md"){$("banner").innerHTML=`<div class="banner" role="region" aria-label="Architecture approval"><div class="ic" aria-hidden="true">🏛</div>
+   <div class="grow" style="min-width:0"><b>The architecture is waiting for your approval</b><div class="sub">Nothing is planned until you approve it. Read it and ask the architect in Review.</div></div>
+   <button class="btn ok" data-review="${esc(fa)}">Open in Review</button></div>`;return}
   if(!d){$("banner").innerHTML="";return}
   const last=[...S.events].reverse().find(e=>e.item_key===d.key&&e.actor==="designer"&&e.kind==="status");
   $("banner").innerHTML=`<div class="banner" role="region" aria-label="Design approval"><div class="ic" aria-hidden="true">🎨</div>
    <div class="grow" style="min-width:0"><b>Design ${esc(d.key)} is ready for your review</b><div class="sub">${esc(last?last.text.split(": ").slice(1).join(": "):d.title)}</div></div>
    <a class="btn ghost" href="design/${esc(d.key)}" target="_blank" rel="noopener">Open mockup ↗</a>
+   <button class="btn ghost" data-review="design:${esc(d.key)}">Review &amp; ask</button>
    <button class="btn ok" data-design="approve" data-dkey="${esc(d.key)}">Approve</button>
    <button class="btn warn" data-design="changes" data-dkey="${esc(d.key)}">Request changes</button></div>`}
 
@@ -440,7 +461,7 @@ function card(t){const live=liveOn(t);
      <div class="top"><span class="mono">🎨 ${esc(t.key)}</span><span class="grow"></span><span class="chip pink">${esc(dm.mode||"design")}</span></div>
      <div class="ttl">${esc(t.title)}</div>
      <div class="foot"><span class="av mini designer" title="designer">DS</span>
-      ${t.status==="review"?`<span class="chip pink">Needs your approval</span>`:""}
+      ${t.status==="review"&&!String(t.qa_by||"").startsWith("approved")?`<span class="chip pink" role="button" data-review="design:${esc(t.key)}" title="Open in Review">Needs your approval</span>`:""}
       ${t.qa_rounds?`<span class="chip amber">changes ×${t.qa_rounds}</span>`:""}
       ${t.status!=="todo"?`<a class="chip" href="design/${esc(t.key)}" target="_blank" rel="noopener">mockup ↗</a>`:""}</div>
      ${live?`<div class="livebar pink">● designer · ${esc(live.activity||"designing")}</div>`:""}</div>`}
@@ -456,7 +477,7 @@ function card(t){const live=liveOn(t);
      ${t.assignee?`<span class="av mini ${roleOf(t.assignee)}" title="developer ${esc(t.assignee)}">${ini(t.assignee)}</span>`:""}
      ${qaName&&t.status!=="todo"&&!qaName.startsWith("approved")?`<span class="av mini qa" title="QA ${esc(qaName)}">${ini(qaName)}</span>`:""}
      ${t.qa_rounds?`<span class="chip red" title="sent back by QA">↺ ${t.qa_rounds}</span>`:""}
-     ${escd?`<span class="chip red" title="escalated to you">⚑ needs you</span>`:""}
+     ${escd?`<span class="chip red" role="button" data-review="escalated:${esc(t.key)}" title="escalated to you: open in Review">⚑ needs you</span>`:""}
      ${cardCost(t)}
      ${waiting.length&&t.status==="todo"?`<span class="chip amber" title="waiting on">🔒 ${esc(waiting.join(", "))}</span>`:""}
    </div>
@@ -537,8 +558,8 @@ function detail(key){const t=S.items.find(i=>i.key===key);if(!t)return;openKey=k
    ${(t.files||[]).length?`<dt>Files</dt><dd class="mono" style="font-size:12px">${t.files.map(esc).join("<br>")}</dd>`:""}
    ${t.ext_url?`<dt>${esc(S.meta.tracker)}</dt><dd><a href="${esc(t.ext_url)}" target="_blank" rel="noopener">${esc(t.ext_key)} ↗</a></dd>`:""}
    ${t.type==="design"&&t.status!=="todo"?`<dt>Mockup</dt><dd><a href="design/${esc(t.key)}" target="_blank" rel="noopener">open mockup ↗</a> · <a href="design/${esc(t.key)}/notes" target="_blank" rel="noopener">design notes</a></dd>`:""}
-   ${t.type==="design"&&t.status==="review"?`<dt>Decision</dt><dd><button class="btn ok" data-design="approve" data-dkey="${esc(t.key)}">Approve</button> <button class="btn warn" data-design="changes" data-dkey="${esc(t.key)}">Request changes</button></dd>`:""}
-   ${(S.meta.escalated||[]).includes(t.key)?`<dt>Escalated</dt><dd><button class="btn warn" data-resume="${esc(t.key)}">Resume with guidance</button></dd>`:""}</dl>
+   ${t.type==="design"&&t.status==="review"?`<dt>Decision</dt><dd><button class="btn ok" data-design="approve" data-dkey="${esc(t.key)}">Approve</button> <button class="btn warn" data-design="changes" data-dkey="${esc(t.key)}">Request changes</button> <button class="btn ghost" data-review="design:${esc(t.key)}">Review &amp; ask</button></dd>`:""}
+   ${(S.meta.escalated||[]).includes(t.key)?`<dt>Escalated</dt><dd><button class="btn warn" data-resume="${esc(t.key)}">Resume with guidance</button> <button class="btn ghost" data-review="escalated:${esc(t.key)}">Open in Review</button></dd>`:""}</dl>
    ${t.description?`<div class="sec">Description</div><pre class="desc">${esc(t.description)}</pre>`:""}
    ${(t.acceptance||[]).length?`<div class="sec">Acceptance criteria</div><ul class="ac">${t.acceptance.map(a=>`<li>${esc(a)}</li>`).join("")}</ul>`:""}
    ${kids.length?`<div class="sec">${t.type==="epic"?"Stories":"Tasks"}</div>${kids.map(k=>`<div class="kid" data-key="${esc(k.key)}"><span class="mono sub">${esc(k.key)}</span><span class="grow">${esc(k.title)}</span>${badge(k.status)}</div>`).join("")}`:""}
@@ -548,22 +569,24 @@ function detail(key){const t=S.items.find(i=>i.key===key);if(!t)return;openKey=k
 function render(){keepScroll(()=>{renderHeader();renderBanner();renderNow();renderNav();renderCrumb();renderTeam();
   view==="board"?renderBoard():renderList();renderFeed();if($("dlg").open&&openKey)detail(openKey)})}
 async function poll(){try{const r=await fetch("api/board?since="+since);const d=await r.json();
-    S.items=d.items;S.agents=d.agents;S.meta=d.meta;S.messages=d.messages;S.progress=d.progress||{};S.live=d.live||{};S.cost=d.cost||{};S.now=d.now||Date.now()/1000;
+    S.items=d.items;S.agents=d.agents;S.meta=d.meta;S.messages=d.messages;S.progress=d.progress||{};S.live=d.live||{};S.cost=d.cost||{};S.review=d.review||{};S.now=d.now||Date.now()/1000;
     if(d.events.length){S.events=since?S.events.concat(d.events).slice(-800):d.events;since=d.events[d.events.length-1].id}
-    const sig=JSON.stringify([d.items,d.agents,d.meta,since,d.progress,d.live,d.cost]);if(sig!==lastSig){lastSig=sig;render()}
+    const sig=JSON.stringify([d.items,d.agents,d.meta,since,d.progress,d.live,d.cost,d.review]);if(sig!==lastSig){lastSig=sig;render()}
   }catch(e){$("runstate").textContent="offline";$("rundot").className="dot needs-human"}finally{setTimeout(poll,1500)}}
 
 /* events */
 function setView(v){view=v;document.querySelectorAll(".seg button").forEach(b=>b.setAttribute("aria-selected",b.dataset.view===v));
   $("board").hidden=v!=="board";$("list").hidden=v!=="list";store.set("sdlc-board-view",v);render()}
 document.addEventListener("click",e=>{
+  const rv=e.target.closest("[data-review]");if(rv){e.preventDefault();e.stopPropagation();if($("dlg").open)$("dlg").close();setTab("review",rv.dataset.review);return}
+  const tb=e.target.closest("[data-tab]");if(tb){setTab(tb.dataset.tab);return}
   const da=e.target.closest("[data-design]");if(da){designAction(da.dataset.dkey,da.dataset.design);return}
   const rs=e.target.closest("[data-resume]");if(rs){resumeTask(rs.dataset.resume);return}
   const sv=e.target.closest(".seg button");if(sv){setView(sv.dataset.view);return}
   const ep=e.target.closest("[data-epic]");if(ep&&!e.target.closest("a")){const k=ep.dataset.epic;closedEpics.has(k)?closedEpics.delete(k):closedEpics.add(k);render();return}
   const gp=e.target.closest("[data-group]");if(gp){const k=gp.dataset.group;closedGroups.has(k)?closedGroups.delete(k):closedGroups.add(k);render();return}
   const st=e.target.closest("[data-story]");if(st){fstory=st.dataset.story;render();return}
-  if(e.target.closest("#needs")){const d=S.items.find(i=>i.type==="design"&&i.status==="review");detail(d?d.key:(S.meta.escalated||[])[0]);return}
+  if(e.target.closest("#needs")){setTab("review",S.review.first||"");return}
   const k=e.target.closest("[data-key]");if(k&&!e.target.closest("a[target]")){e.preventDefault();detail(k.dataset.key)}});
 document.addEventListener("keydown",e=>{
   if(e.key==="/"&&document.activeElement.tagName!=="INPUT"){e.preventDefault();$("q").focus();return}
@@ -584,7 +607,15 @@ $("compose").onsubmit=async e=>{e.preventDefault();const text=$("msg").value.tri
 (function theme(){const saved=store.get("sdlc-board-theme");if(saved)document.documentElement.dataset.theme=saved;
   $("theme").onclick=()=>{const cur=document.documentElement.dataset.theme||(matchMedia("(prefers-color-scheme: light)").matches?"light":"dark");
     const nx=cur==="light"?"dark":"light";document.documentElement.dataset.theme=nx;store.set("sdlc-board-theme",nx)}})();
+let rvLoaded=false;
+function setTab(t,id){document.body.classList.toggle("rv",t==="review");
+  document.querySelectorAll("[data-tab]").forEach(b=>b.setAttribute("aria-selected",b.dataset.tab===t));
+  const f=$("reviewView");f.hidden=t!=="review";
+  if(t==="review"){if(!rvLoaded){f.src="review"+(id?"#"+encodeURIComponent(id):"");rvLoaded=true}
+    else if(id){try{f.contentWindow.location.hash=encodeURIComponent(id)}catch(e){f.src="review#"+encodeURIComponent(id)}}}
+  history.replaceState(null,"",t==="review"?"#review"+(id?"="+encodeURIComponent(id):""):location.pathname+location.search)}
 if(store.get("sdlc-board-view")==="list")setView("list");
+if(location.hash.startsWith("#review"))setTab("review",decodeURIComponent(location.hash.slice(8)));
 poll();
 </script>
 </body>
@@ -810,6 +841,25 @@ class Handler(BaseHTTPRequestHandler):
     board: Board = None  # set in main
     root: Path = None
     cfg: dict = {}
+    review: Review = None
+
+    def _send(self, body: bytes, ctype: str, extra: dict | None = None):
+        self.send_response(200)
+        self.send_header("Content-Type", ctype)
+        self.send_header("Content-Length", str(len(body)))
+        self.send_header("Cache-Control", "no-store")
+        for k, v in (extra or {}).items():
+            self.send_header(k, v)
+        self.end_headers()
+        self.wfile.write(body)
+
+    def _body(self) -> dict | None:
+        n = int(self.headers.get("Content-Length") or 0)
+        try:
+            d = json.loads(self.rfile.read(min(n, 20000)) or b"{}")
+        except json.JSONDecodeError:
+            return None
+        return d if isinstance(d, dict) else None
 
     def design_file(self, name: str) -> Path | None:
         """The design file from the designer's worktree (latest) or the integration branch (approved)."""
@@ -858,19 +908,68 @@ class Handler(BaseHTTPRequestHandler):
             self.send_header("Content-Length", str(len(body)))
             self.end_headers()
             self.wfile.write(body)
+        elif u.path == "/review":
+            self._send(REVIEW_PAGE.encode(), "text/html; charset=utf-8")
+        elif u.path.startswith("/api/review"):
+            self.review_get(u.path, {k: v[0] for k, v in parse_qs(u.query).items()})
         elif u.path == "/api/board":
             since = int((parse_qs(u.query).get("since") or ["0"])[0] or 0)
             snap = self.board.snapshot(since=since)
             snap["progress"] = live_progress(self.board, self.root, self.cfg) if self.root else {}
             snap["live"] = live_activity(self.root) if self.root else {}
             snap["cost"] = live_cost(self.board, self.root) if self.root else {}
+            snap["review"] = self.review_summary()
             snap["now"] = time.time()
             self._json(snap)
         else:
             self._json({"error": "not found"}, 404)
 
+    def review_summary(self) -> dict:
+        try:
+            needs = [a["id"] for a in self.review.artifacts() if a["needs"]] if self.review else []
+        except Exception:
+            needs = []
+        return {"count": len(needs), "first": needs[0] if needs else ""}
+
+    def review_get(self, path: str, q: dict):
+        if not self.review:
+            return self._json({"error": "review needs a project folder"}, 404)
+        if path == "/api/review":
+            arts = self.review.artifacts()
+            return self._json({"artifacts": arts, "count": sum(a["needs"] for a in arts)})
+        if path == "/api/review/doc":
+            d = self.review.doc(q.get("id", ""), q.get("ver", ""))
+            return self._json(d) if d else self._json({"error": "unknown document"}, 404)
+        if path == "/api/review/chat":
+            if not self.review.find(q.get("id", "")):
+                return self._json({"error": "unknown document"}, 404)
+            return self._json(self.review.chat(q["id"]))
+        if path == "/api/review/file":
+            p = self.review.file(q.get("path", ""))
+            if not p:
+                return self._json({"error": "not found"}, 404)
+            types = {".png": "image/png", ".svg": "image/svg+xml", ".jpg": "image/jpeg", ".jpeg": "image/jpeg", ".webp": "image/webp"}
+            return self._send(p.read_bytes(), types[p.suffix.lower()],
+                              {"Content-Security-Policy": "default-src 'none'; style-src 'unsafe-inline'; sandbox",
+                               "X-Content-Type-Options": "nosniff"})
+        return self._json({"error": "not found"}, 404)
+
     def do_POST(self):
         path = urlparse(self.path).path
+        if path in ("/api/review/chat", "/api/review/decide"):
+            if not self.review:
+                return self._json({"error": "review needs a project folder"}, 404)
+            d = self._body()
+            if d is None:
+                return self._json({"error": "bad json"}, 400)
+            id_, text = str(d.get("id") or ""), str(d.get("text") or "").strip()
+            if path == "/api/review/chat":
+                if not text:
+                    return self._json({"error": "empty"}, 400)
+                r = self.review.post(id_, text[:4000], str(d.get("quote") or "")[:600], str(d.get("section") or "")[:120])
+            else:
+                r = self.review.decide(id_, str(d.get("action") or ""), text)
+            return self._json(r, 400 if r.get("error") else 200)
         if path == "/api/design":
             n = int(self.headers.get("Content-Length") or 0)
             try:
@@ -935,6 +1034,8 @@ def main() -> None:
         Handler.cfg = load_config(Handler.root) if (Handler.root / ".sdlc" / "config.json").is_file() else {}
     except Exception:
         Handler.root = Handler.board.path.parent.parent.parent
+    if Handler.root and (Handler.root / ".git").exists():
+        Handler.review = Review(Handler.root, Handler.cfg, Handler.board)
     srv = QuietServer((a.host, port), Handler)
     print(f"team board: http://{a.host}:{port}   (db {Handler.board.path})", flush=True)
     try:
